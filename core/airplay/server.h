@@ -41,8 +41,13 @@ struct ReceiverConfig {
     std::string stateDir;                   ///< 空 = defaultStateDir()
     std::string mfiDir   = "identity";      ///< MFi 身份目录（identity.pk8 + certificate.p7b）
     std::string btMac;                      ///< 本机蓝牙 MAC（/info bluetoothIDs 用）
+    std::string wirelessSsid;
     core::IVideoOutput* video = nullptr;    ///< 视频输出（解码+上屏；空则屏幕流不建）
     core::IAudioOutput* audio = nullptr;    ///< 音频输出（解码+播放；空则音频流不建）
+    core::IVideoOutput* clusterVideo = nullptr;
+    int clusterWidth = 0;
+    int clusterHeight = 0;
+    bool advertiseCluster = false;
     bool        enableAvahi = true;
 };
 

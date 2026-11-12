@@ -32,6 +32,7 @@
 
 #include <SDL.h>
 
+#include <algorithm>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -47,6 +48,10 @@ void onSignal(int) { g_stop = 1; }
 struct Options {
     int         screenW   = 1280;
     int         screenH   = 720;
+    int         clusterW = 0;
+    int         clusterH = 0;
+    bool        advertiseCluster = false;
+    std::string clusterDump;
     int         barH      = 26;
     bool        barOn     = false;   // --statusbar：调试叠加（默认关，保证真·全屏视频）
     bool        fullscreen = false;
@@ -86,6 +91,9 @@ void printUsage(const char* argv0)
     std::printf(
         "用法: %s [选项]\n"
         "  --screen WxH      视频面尺寸（默认 1280x720，也是向手机协商的目标分辨率）\n"
+        "  --cluster-screen WxH  Experimental independent instrument display (e.g. 960x360)\n"
+        "  --cluster-advertise   Opt in to unverified secondary-display protocol (may reject session)\n"
+        "  --cluster-dump PATH   Save instrument display as PPM\n"
         "  --fullscreen      全屏（SDL_WINDOW_FULLSCREEN_DESKTOP）\n"
         "  --statusbar       叠加状态栏（调试用；默认关，接了视频就是全屏画面）\n"
         "  --statusbar-h N   状态栏高度（默认 26）\n"
@@ -148,6 +156,16 @@ bool parseArgs(int argc, char** argv, Options* o)
                 std::fprintf(stderr, "--screen 需要 WxH，如 1280x720\n");
                 return false;
             }
+        } else if (!std::strcmp(a, "--cluster-screen")) {
+            if (!parseScreen(need(a), &o->clusterW, &o->clusterH) ||
+                o->clusterW > 8192 || o->clusterH > 8192) {
+                std::fprintf(stderr, "--cluster-screen requires WxH within 1..8192\n");
+                return false;
+            }
+        } else if (!std::strcmp(a, "--cluster-dump")) {
+            o->clusterDump = need(a);
+        } else if (!std::strcmp(a, "--cluster-advertise")) {
+            o->advertiseCluster = true;
         } else if (!std::strcmp(a, "--fullscreen")) {
             o->fullscreen = true;
         } else if (!std::strcmp(a, "--statusbar")) {
@@ -342,6 +360,18 @@ int main(int argc, char** argv)
         printUsage(argv[0]);
         return 0;
     }
+    const bool clusterEnabled = opt.clusterW > 0;
+    if ((clusterEnabled && opt.noVideo) ||
+        (!clusterEnabled && (!opt.clusterDump.empty() || opt.advertiseCluster))) {
+        std::fprintf(stderr, "Instrument display requires video and --cluster-screen\n");
+        return 2;
+    }
+#ifndef ALLPLAY_HAVE_FFMPEG
+    if (clusterEnabled) {
+        std::fprintf(stderr, "Instrument display requires FFmpeg\n");
+        return 2;
+    }
+#endif
     if (!opt.font.empty()) setenv("ALLPLAY_FONT", opt.font.c_str(), 1);
 
     std::signal(SIGINT, onSignal);
@@ -402,6 +432,7 @@ int main(int argc, char** argv)
     core::IAudioOutput* aud = nullptr;
 #ifdef ALLPLAY_HAVE_FFMPEG
     allplay::SdlVideoSink videoSink;
+    allplay::SdlVideoSink clusterSink;
     allplay::SdlAudioSink audioSink;
     if (!opt.noVideo) vid = &videoSink;
     if (!opt.noAudio) aud = &audioSink;
@@ -437,6 +468,18 @@ int main(int argc, char** argv)
     cfg.enableAvahi = !opt.noAvahi;
     cfg.video     = vid;
     cfg.audio     = aud;
+    if (opt.btOn) {
+        cfg.btMac = allplay::posix::controllerAddress();
+        cfg.wirelessSsid = opt.btSsid.empty() ? allplay::posix::currentSSID() : opt.btSsid;
+    }
+#ifdef ALLPLAY_HAVE_FFMPEG
+    if (clusterEnabled) {
+        cfg.clusterVideo = &clusterSink;
+        cfg.clusterWidth = opt.clusterW;
+        cfg.clusterHeight = opt.clusterH;
+        cfg.advertiseCluster = opt.advertiseCluster;
+    }
+#endif
 
     // 平台服务要在 main 的整个生命周期里活着：Receiver 只拷了一份，而 Session 到 SETUP
     // 才第一次用它去建数据/事件通道（存临时对象的地址就是当年那个悬垂指针）。
@@ -497,6 +540,45 @@ int main(int argc, char** argv)
     // —— 蓝牙触发（--bt）——
     // 必须放在 rx.start() 之后：触发参数要用 rx.ip()/port()/info()，它们启动完才有效。
     // 触发本身跑在 BtTask 自己的线程上（runBtTrigger 是全阻塞的，放主线程会冻住画面）。
+    SDL_Window* clusterWin = nullptr;
+    SDL_Renderer* clusterRen = nullptr;
+    if (clusterEnabled) {
+        clusterWin = SDL_CreateWindow("AllPlay Instrument Cluster (Experimental)",
+                                      SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                      opt.clusterW, opt.clusterH, SDL_WINDOW_RESIZABLE);
+        if (clusterWin) {
+            clusterRen = SDL_CreateRenderer(clusterWin, -1, SDL_RENDERER_ACCELERATED);
+            if (!clusterRen) clusterRen = SDL_CreateRenderer(clusterWin, -1, SDL_RENDERER_SOFTWARE);
+        }
+        if (!clusterWin || !clusterRen) {
+            std::fprintf(stderr, "Instrument window creation failed: %s\n", SDL_GetError());
+            rx.stop();
+            if (clusterRen) SDL_DestroyRenderer(clusterRen);
+            if (clusterWin) SDL_DestroyWindow(clusterWin);
+            SDL_DestroyRenderer(ren);
+            SDL_DestroyWindow(win);
+            SDL_Quit();
+            return 1;
+        }
+        SDL_Rect bounds{};
+        if (SDL_GetDisplayUsableBounds(SDL_GetWindowDisplayIndex(win), &bounds) == 0 && bounds.w > 300) {
+            const int mainW = std::min(opt.screenW, (bounds.w - 36) * opt.screenW /
+                                                   (opt.screenW + opt.clusterW));
+            const int clusterW = std::min(opt.clusterW, bounds.w - mainW - 36);
+            const int mainH = std::min(bounds.h - 48, mainW * winPxH / opt.screenW);
+            const int clusterH = std::min(bounds.h - 48, clusterW * opt.clusterH / opt.clusterW);
+            SDL_SetWindowSize(win, mainW, mainH);
+            SDL_SetWindowPosition(win, bounds.x + 12, bounds.y + 24);
+            SDL_SetWindowSize(clusterWin, clusterW, clusterH);
+            SDL_SetWindowPosition(clusterWin, bounds.x + mainW + 24, bounds.y + 24);
+        }
+        std::printf("[host] Instrument window ready: %dx%d; independent stream, not a mirror\n",
+                    opt.clusterW, opt.clusterH);
+        std::printf("[host] Secondary display advertisement: %s\n",
+                opt.advertiseCluster ? "EXPERIMENTAL (iPhone compatibility unverified)" :
+                           "OFF (single-display protocol; instrument window remains blank)");
+    }
+
     allplay::BtTask        btTask;
     allplay::BtTaskOptions btOpt;
     btOpt.name          = opt.name;
@@ -527,6 +609,16 @@ int main(int argc, char** argv)
     while (running && !g_stop) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_CLOSE) {
+                running = false;
+                continue;
+            }
+            if ((e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEBUTTONUP) &&
+                e.button.windowID != SDL_GetWindowID(win)) continue;
+            if (e.type == SDL_MOUSEMOTION && e.motion.windowID != SDL_GetWindowID(win)) continue;
+            if (e.type == SDL_MOUSEWHEEL && e.wheel.windowID != SDL_GetWindowID(win)) continue;
+            if ((e.type == SDL_FINGERDOWN || e.type == SDL_FINGERUP || e.type == SDL_FINGERMOTION) &&
+                e.tfinger.windowID != SDL_GetWindowID(win)) continue;
             if (e.type == SDL_QUIT) running = false;
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) running = false;
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_w &&
@@ -645,7 +737,10 @@ int main(int argc, char** argv)
             // 会话结束必须把末帧丢掉：sink 会一直重画纹理里那一帧
             // （"画面停住而不是消失"是为会话中途掉帧设计的），
             // 留着它就让上面那句"回启动页"变成谎话——画面卡死在最后一帧。
-            if (!streaming) videoSink.dropFrame();
+            if (!streaming) {
+                videoSink.dropFrame();
+                clusterSink.dropFrame();
+            }
 #endif
         }
 
@@ -679,6 +774,20 @@ int main(int argc, char** argv)
         if (opt.barOn) bar.draw(ren, status);
         SDL_RenderPresent(ren);
 
+    #ifdef ALLPLAY_HAVE_FFMPEG
+        if (clusterRen) {
+            int clusterW = 0, clusterH = 0, sourceW = 0, sourceH = 0;
+            SDL_GetRendererOutputSize(clusterRen, &clusterW, &clusterH);
+            clusterSink.intrinsicSize(&sourceW, &sourceH);
+            SDL_Rect clusterRect{};
+            allplay::fitLetterbox(sourceW, sourceH, clusterW, clusterH, &clusterRect);
+            SDL_SetRenderDrawColor(clusterRen, 18, 20, 22, 255);
+            SDL_RenderClear(clusterRen);
+            clusterSink.present(clusterRen, clusterRect);
+            SDL_RenderPresent(clusterRen);
+        }
+    #endif
+
         pad.flush(rx, videoRect, streaming);
 
         // —— 无头触摸注入（--inject-touch）——
@@ -697,6 +806,7 @@ int main(int argc, char** argv)
                 ev.button.type     = ev.type;
                 ev.button.state    = down ? SDL_PRESSED : SDL_RELEASED;
                 ev.button.button   = SDL_BUTTON_LEFT;
+                ev.button.windowID = SDL_GetWindowID(win);
                 ev.button.which    = 0;          // 真鼠标（SDL_TOUCH_MOUSEID 才是触屏合成的）
                 ev.button.clicks   = 1;
                 ev.button.x        = px;
@@ -725,6 +835,8 @@ int main(int argc, char** argv)
         if (!opt.dump.empty() && opt.frames > 0 && rendered == opt.frames - 1) {
             allplay::dumpRender(ren, opt.dump);
         }
+        if (clusterRen && !opt.clusterDump.empty() && opt.frames > 0 && rendered == opt.frames - 1)
+            allplay::dumpRender(clusterRen, opt.clusterDump);
         if (opt.frames > 0 && ++rendered >= opt.frames) {
             std::printf("[host] 冒烟：已渲染 %d 帧，正常退出\n", rendered);
             break;
@@ -750,6 +862,16 @@ int main(int argc, char** argv)
                 (unsigned long long)audioSink.underruns(),
                 (unsigned long long)audioSink.dropped(),
                 audioSink.deviceOpen() ? "" : "（设备没开）");
+#endif
+    if (clusterRen) {
+#ifdef ALLPLAY_HAVE_FFMPEG
+        clusterSink.dropFrame();
+#endif
+        SDL_DestroyRenderer(clusterRen);
+        SDL_DestroyWindow(clusterWin);
+    }
+#ifdef ALLPLAY_HAVE_FFMPEG
+    videoSink.dropFrame();
 #endif
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);

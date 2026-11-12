@@ -26,8 +26,10 @@ add_library(allplay_core STATIC
     airplay/control_cipher.cpp
     airplay/video_stream.cpp
     airplay/event_channel.cpp
+    airplay/iap_tunnel.cpp
     airplay/audio_stream.cpp
     iap2/wire.cpp
+    iap2/route_guidance.cpp
     iap2/link.cpp
     iap2/wireless_client.cpp
     iap2/wired_link.cpp

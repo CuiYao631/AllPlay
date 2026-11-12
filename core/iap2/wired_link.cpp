@@ -216,6 +216,7 @@ bool WiredLink::pumpMessages(int readTimeoutMs, std::vector<Message>* out)
     Message m;
     while (framer_.next(&m.id, &m.body)) {
         LOG_INFO("[%s] iAP2 rx=%s", kTag, hex4(m.id).c_str());
+        if (m.id == 0x5201 || m.id == 0x5202) routeGuidance_.accept(m.id, m.body);
         out->push_back(m);
     }
     return true;

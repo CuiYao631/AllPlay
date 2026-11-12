@@ -182,6 +182,81 @@ bash scripts/build.sh          # 产物在 build/
 - **同网段若还有别的 CarPlay 接收端**（自带 MFi 的车机等），iPhone 有自动回连行为，
   可能连到它那边去 —— 测本机时建议先把那台断电。
 
+### 仪表双窗口模拟（实验性）
+
+在桌面启动参数中加入 `--cluster-screen 960x360`，开启中控与仪表两个独立窗口：
+
+```bash
+./build/allplay_host --identity identity --statusbar --port 7100 \
+  --cluster-screen 960x360 \
+  --font '/System/Library/Fonts/Supplemental/Arial Unicode.ttf'
+```
+
+需要蓝牙触发时，保留原先的 `--bt` / `--bt-device` / Wi-Fi 参数，只增加
+`--cluster-screen`。两个窗口会自动并排摆放，可独立调整大小；关闭任一窗口或按 ESC 退出。
+触摸只回传中控，仪表窗口没有触摸输入。
+
+`--cluster-screen` 默认仅创建窗口，**不改变已验证的单屏协议声明**，因此仪表窗口
+会保持空白。需要测试真正的副屏协商时，额外加 `--cluster-advertise`：
+
+```bash
+./build/allplay_host --identity identity --statusbar --port 7100 \
+  --cluster-screen 960x360 --cluster-advertise \
+  --font '/System/Library/Fonts/Supplemental/Arial Unicode.ttf'
+```
+
+实验声明向 `/info` 增加独立 UUID 的 type 111 副屏，带地图 `initialURL`、整数输入模式
+和物理尺寸，并按 `displayUUID`（未提供时按 type 111）分配独立解码器、数据端口和窗口。
+**不是复制或裁剪中控地图。** 此开关可能导致不兼容的 iPhone 结束整个会话；若出现
+`RECORD` 后立即 `TEARDOWN: full session`，先去掉 `--cluster-advertise` 验证主屏恢复。
+
+**当前仅完成实验声明、双流路由与双窗口模拟，不代表已验证 iPhone 的仪表地图协商。**
+`altScreen` 能力、屏幕角色及导航上下文仍需真机确认；不能仅凭两个窗口判定仪表导航成功。
+开启导航后，可检查日志是否出现 `SETUP screen route=cluster`，再确认副屏实际内容。
+实验模式的首批 `SETUP` 应返回 `enabledFeatures=[iAPChannel,viewAreas,altScreen]`，
+使特性协商与双屏声明一致。`Source /info` 中的 `mapOffered=unknown` 只表示未收到
+URL 列表，不代表手机不支持仪表地图。
+字段参考 [DiPlay 仪表导航文档](https://github.com/shihabal3amri/DiPlay/blob/main/docs/BYD_NAVIGATION.md)
+及其 `AirPlayInfoPlist` / `CarPlayClusterDisplay` 实现，不代表本项目已完成相同的协议交互。
+
+不使用 iPhone 的双流验收：宿主额外启用 `--cluster-advertise`，使用不同尺寸/内容的
+两份裸 H.264 素材：
+
+```bash
+./build/fake_phone --h264 main.h264 --cluster-h264 cluster.h264 --port 7100 --loop
+```
+
+无头验收可配合 `--frames N --dump main.ppm --cluster-dump cluster.ppm` 分别保存两屏。
+
+### TBT 导航日志
+
+收到 iAP2 `0x5201`（路线更新）和 `0x5202`（动作详情）时，协议核心自动输出
+`[TBT]` 日志。解析器缓存动作详情，并按当前动作列表关联距离，不把尚未收到的
+字段猜成零；未知动作显示 `unknown` 并保留 `appleType`。
+
+```text
+[TBT] maneuver id=7 action=left appleType=1 drivingSide=0 road="Main Street"
+[TBT] next id=7 action=left appleType=1 road="Main Street" distance_m=350 remaining_m=5400 remaining_s=3600
+[TBT] route state=arrived
+```
+
+`left` / `right` / `straight` 分别表示左转、右转、直行；`distance_m` 是到下一动作
+的米数，`remaining_m` / `remaining_s` 是路线剩余距离和秒数。相同的当前指令摘要不重复输出。
+**道路名和导航距离属于位置信息**，分享日志前应检查并脱敏；日志不打印导航原始报文。
+
+蓝牙及有线 iAP2 接收路径均已接入解析器。无线持续更新还需 AirPlay 运行时 iAP 隧道：
+`type=130`、`clientTypeUUID=E9459FD0-BCAD-4C45-820F-1E72447EF2F2`，由 `seed` 派生
+入站密钥，出站识别/导航订阅经加密事件通道的 `iAPSendMessage` 发送。
+此运行时路径为新接入，分片、加密封装、解析和 SETUP 测试通过，**真机接收仍需验收**。
+重启后检查 `Runtime iAP tunnel connected`、`Runtime iAP2 subscribed to route guidance`
+以及 `[TBT]` 日志；没有结构化更新的地图应用不能仅从副屏视频恢复这些字段。
+启动时应先出现 `[TBT] receiver enabled`。Wi-Fi 运行时隧道使用主动 SYN、控制会话
+版本 2 和零确认配置，不能沿用蓝牙的被动握手。候选 `type=130` 流的 UUID、首批密文、
+首个 `comm` 包和解密失败均有诊断日志，不打印原始导航或认证报文。
+`runtime enqueue msg=0x1d01` 只表示识别信息入队，`runtime event write ... sent=1`
+只表示写入事件通道成功，不能替代手机的 `0x1d02` 识别接受。若停在此阶段，检查
+`runtime comm packet` 的包分类和拒绝参数日志；运行时识别不需要再发送 `0x4301`。
+
 #### 有线的前置条件（Linux，**缺一不可**）
 
 ```bash

@@ -22,6 +22,7 @@
 
 #include "iap2/link.h"
 #include "iap2/wire.h"
+#include "iap2/route_guidance.h"
 #include "port/stream.h"
 
 #include <cstdint>
@@ -158,6 +159,7 @@ private:
     /// **跨 identify/authenticate 保留**：手机的 0xAA00 完全可能在上一步的泵里就到了，
     /// 每步各建一个 framer 会把半条消息丢掉（现象：认证永远等不到 0xAA00）。
     CsmFramer          framer_;
+    RouteGuidance      routeGuidance_;
 };
 
 /// 单调毫秒（链路层的时间都由调用方给，这里给个统一的来源）

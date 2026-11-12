@@ -7,6 +7,8 @@
 namespace core::airplay {
 
 const char* const kMainDisplayUuid = "b7e6c5a0-1111-4000-8000-000000000001";
+const char* const kClusterDisplayUuid = "b7e6c5a0-2222-4000-8000-000000000002";
+const char* const kClusterMapUrl = "maps:/car/instrumentcluster/map";
 const char* const kSourceVersion   = "950.7.1";
 const char* const kProtoVersion    = "1.1";
 
@@ -124,19 +126,22 @@ std::vector<uint8_t> buildInfoPlist(const DeviceInfo& info)
     const int width = info.width, height = info.height;
 
     // displays[]：主屏（110）。uuid 用协议的小写键名；type 必须给 110。
-    const Ptr area = dict({
-        {"widthPixels",  u((uint64_t)width)},
-        {"heightPixels", u((uint64_t)height)},
+    const auto makeArea = [](int areaWidth, int areaHeight) {
+        return dict({
+        {"widthPixels",  u((uint64_t)areaWidth)},
+        {"heightPixels", u((uint64_t)areaHeight)},
         {"originXPixels",u(0)},
         {"originYPixels",u(0)},
         {"safeArea", dict({
-            {"widthPixels",  u((uint64_t)width)},
-            {"heightPixels", u((uint64_t)height)},
+            {"widthPixels",  u((uint64_t)areaWidth)},
+            {"heightPixels", u((uint64_t)areaHeight)},
             {"originXPixels",u(0)},
             {"originYPixels",u(0)},
             {"drawUIOutsideSafeArea", boolean(true)},
         })},
-    });
+        });
+    };
+    const Ptr area = makeArea(width, height);
     std::vector<Ptr> displays = {
         dict({
             {"uuid",             str(kMainDisplayUuid)},
@@ -152,6 +157,28 @@ std::vector<uint8_t> buildInfoPlist(const DeviceInfo& info)
             {"initialViewArea",  u(0)},
         }),
     };
+
+    if (info.advertiseCluster && info.clusterWidth > 0 && info.clusterHeight > 0) {
+        displays.push_back(dict({
+            {"uuid", str(kClusterDisplayUuid)},
+            {"type", u(111)},
+            {"maxFPS", u((uint64_t)info.clusterFps)},
+            {"widthPixels", u((uint64_t)info.clusterWidth)},
+            {"heightPixels", u((uint64_t)info.clusterHeight)},
+            {"widthPhysical", u(292)},
+            {"heightPhysical", u((uint64_t)((292LL * info.clusterHeight + info.clusterWidth / 2) /
+                                           info.clusterWidth))},
+            {"features", u(0)},
+            {"primaryInputDevice", u(0)},
+            {"initialURL", str(kClusterMapUrl)},
+            {"uiAppearanceMode", u(0)},
+            {"uiAppearanceSetting", u(0)},
+            {"mapAppearanceMode", u(0)},
+            {"mapAppearanceSetting", u(0)},
+            {"viewAreas", array({makeArea(info.clusterWidth, info.clusterHeight)})},
+            {"initialViewArea", u(0)},
+        }));
+    }
 
     std::vector<Ptr> hidDevices = {
         hidDevice(0x2a2a2a2a, "AllPlay Touchscreen", multitouchDescriptor(width, height), kMainDisplayUuid),

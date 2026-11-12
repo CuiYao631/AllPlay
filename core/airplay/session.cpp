@@ -76,8 +76,12 @@ AudioFmt parseAudioFormat(uint64_t bits)
 Session::Session(const SessionConfig& cfg)
     : identity_(cfg.identity), info_(cfg.info), stateDir_(cfg.stateDir),
       services_(cfg.services), video_(cfg.video), audio_(cfg.audio),
-      width_(cfg.width), height_(cfg.height)
+    clusterVideo_(cfg.clusterVideo), clusterWidth_(cfg.clusterWidth), clusterHeight_(cfg.clusterHeight),
+    width_(cfg.width), height_(cfg.height)
 {
+    mfiDir_ = cfg.mfiDir;
+    wirelessSsid_ = cfg.wirelessSsid;
+    LOG_INFO("[TBT] receiver enabled; waiting for AirPlay iAP stream type=130");
     if (!cfg.mfiDir.empty()) {
         std::string err;
         mfi_ = mfi::CertificateMfiIdentity::load(cfg.mfiDir, &err);
@@ -88,6 +92,7 @@ Session::Session(const SessionConfig& cfg)
 
 Session::~Session()
 {
+    iapTunnel_.reset();
     stopNtp_.store(true);
     if (ntpSock_) ntpSock_->close();
     if (ntpThread_.joinable()) ntpThread_.join();
@@ -113,21 +118,33 @@ RtspResponse Session::handle(const RtspRequest& req)
                     "GET_PARAMETER, SET_PARAMETER, POST, GET");
         return r;
     }
-    if (req.method == "GET" && pathIs(path, "/info")) return handleInfo();
+    if (req.method == "GET" && pathIs(path, "/info")) return handleInfo(req);
     if (req.method == "POST" && pathIs(path, "/auth-setup")) return handleAuthSetup(req);
     if (req.method == "POST" && pathIs(path, "/pair-setup")) return handlePairSetup(req);
     if (req.method == "POST" && pathIs(path, "/pair-verify")) return handlePairVerify(req);
     if (req.method == "SETUP") return handleSetup(req);
     if (req.method == "RECORD") { sessionActive_ = true; connecting_ = false; return RtspResponse::ok(); }
-    if (req.method == "TEARDOWN") { markDisconnected(); return RtspResponse::ok(); }
+    if (req.method == "TEARDOWN") return handleTeardown(req);
     if (req.method == "POST" && pathIs(path, "/command")) return handleCommand(req);
     if (req.method == "POST" && pathIs(path, "/feedback")) return RtspResponse::ok();
 
     return RtspResponse::ok();   // ANNOUNCE 等未识别路径
 }
 
-RtspResponse Session::handleInfo()
+RtspResponse Session::handleInfo(const RtspRequest& req)
 {
+    if (clusterVideo_) {
+        const auto sourceInfo = req.body.empty() ? nullptr : bplist::parse(req.body.data(), req.body.size());
+        const auto urls = sourceInfo ? bplist::dictGet(sourceInfo, "altScreenURLs") : nullptr;
+        const bool hasUrlList = urls && urls->type == bplist::NodeType::Array;
+        bool mapOffered = false;
+        if (hasUrlList)
+            for (const auto& url : urls->array)
+                if (bplist::strOf(url) == kClusterMapUrl) mapOffered = true;
+        LOG_INFO("Source /info: body=%zu altScreenURLsPresent=%d urlCount=%zu mapOffered=%s clusterAdvertised=%d",
+                 req.body.size(), hasUrlList, hasUrlList ? urls->array.size() : size_t(0),
+             hasUrlList ? (mapOffered ? "yes" : "no") : "unknown", info_->advertiseCluster);
+    }
     RtspResponse r = RtspResponse::ok();
     r.setHeader("Content-Type", "application/x-apple-binary-plist");
     r.body = buildInfoPlist(*info_);
@@ -372,10 +389,19 @@ RtspResponse Session::handleSetup(const RtspRequest& req)
                      (unsigned long long)scid);
 
             if (type == 110 || type == 111) {
+                const std::string displayUuid = bplist::strOf(bplist::dictGet(s, "displayUUID"));
+                const bool cluster = clusterVideo_ && (displayUuid == kClusterDisplayUuid ||
+                                                       (displayUuid.empty() && type == 111));
+                if (clusterVideo_ && !displayUuid.empty() && displayUuid != kMainDisplayUuid &&
+                    displayUuid != kClusterDisplayUuid) {
+                    LOG_WARN("SETUP screen has unknown displayUUID=%s", displayUuid.c_str());
+                    continue;
+                }
+                core::IVideoOutput* output = cluster ? clusterVideo_ : video_;
                 // 屏幕流（TCP dataPort）
                 // 这两种跳过都别静默：手机拿不到 dataPort 只会闷头等十几秒然后断开，
                 // 日志里就剩一句"SETUP 完就断线"，极难定位（真机上踩过一次）。
-                if (!video_) {
+                if (!output) {
                     LOG_WARN("SETUP 要屏幕流，但本进程没接 IVideoOutput —— 屏幕流不建，"
                              "手机拿不到 dataPort 将会超时断开");
                     continue;
@@ -388,25 +414,71 @@ RtspResponse Session::handleSetup(const RtspRequest& req)
                     continue;
                 }
                 const uint16_t port = listener->port();
-                streams_.push_back(std::make_unique<ScreenStream>(
-                    std::move(listener), shared_, std::to_string(scid), width_, height_, video_,
-                    [this] { requestKeyFrame(); }));
+                LOG_INFO("SETUP screen route=%s type=%llu displayUUID=%s",
+                         cluster ? "cluster" : "main", (unsigned long long)type, displayUuid.c_str());
+                streams_.push_back({type, scid, cluster, std::make_unique<ScreenStream>(
+                    std::move(listener), shared_, std::to_string(scid),
+                    cluster ? clusterWidth_ : width_, cluster ? clusterHeight_ : height_, output,
+                    [this] { requestKeyFrame(); })});
                 outStreams.push_back(bplist::dict({
                     {"type", bplist::u(type)},
                     {"dataPort", bplist::u(port)},
+                }));
+            } else if (type == 130) {
+                const auto clientNode = bplist::dictGet(s, "clientTypeUUID");
+                const auto clientType = lower(bplist::strOf(clientNode));
+                const auto seed = bplist::dictGet(s, "seed");
+                LOG_INFO("[TBT] data stream candidate uuid=%s uuidNodeType=%d seedPresent=%d seedNodeType=%d",
+                         clientType.c_str(), clientNode ? int(clientNode->type) : -1,
+                         bool(seed), seed ? int(seed->type) : -1);
+                if (clientType != "e9459fd0-bcad-4c45-820f-1e72447ef2f2") {
+                    LOG_WARN("[TBT] data stream ignored: not the supported iAP client UUID");
+                    continue;
+                }
+                if (!seed || seed->type != bplist::NodeType::Uint || shared_.empty() ||
+                    !services_ || !services_->makeTcpListener) {
+                    LOG_WARN("[TBT] iAP SETUP rejected: missing seed, keys or transport");
+                    continue;
+                }
+                auto listener = services_->makeTcpListener();
+                std::string listenError;
+                if (!listener || !listener->start("", 0, &listenError)) {
+                    LOG_WARN("[TBT] iAP listener failed: %s", listenError.c_str());
+                    continue;
+                }
+                core::iap2::WirelessTriggerConfig runtime;
+                runtime.name = info_ ? info_->name : "AllPlay";
+                runtime.btMac = info_ ? info_->btMac : "";
+                runtime.ssid = wirelessSsid_;
+                runtime.mfiDir = mfiDir_;
+                iapTunnel_.reset();
+                iapConnectionId_ = scid;
+                iapTunnel_ = std::make_unique<IapTunnel>(std::move(listener), shared_, seed->u, runtime,
+                    [this](const std::vector<uint8_t>& bytes) {
+                        if (!eventChannel_) return false;
+                        return eventChannel_->sendCommand(bplist::dict({
+                            {"type", bplist::str("iAPSendMessage")},
+                            {"params", bplist::dict({{"data", bplist::data(bytes)}})},
+                        }));
+                    });
+                outStreams.push_back(bplist::dict({
+                    {"type", bplist::u(130)},
+                    {"streamID", bplist::u(1)},
+                    {"dataPort", bplist::u(iapTunnel_->port())},
+                    {"streamConnectionID", bplist::u(scid)},
                 }));
             } else if (type == 100 || type == 101 || type == 102) {
                 // 音频流（UDP RTP dataPort + RTCP controlPort）
                 if (!services_ || !services_->makeUdpSocket || !audio_ || shared_.empty()) continue;
                 const AudioFmt fmt = parseAudioFormat(bplist::uintOf(bplist::dictGet(s, "audioFormat")));
                 audio_->configure(fmt.codec, fmt.rate, fmt.channels);
-                audioStreams_.push_back(std::make_unique<AudioStream>(
+                audioStreams_.push_back({type, scid, std::make_unique<AudioStream>(
                     services_->makeUdpSocket, shared_, std::to_string(scid),
-                    fmt.codec, fmt.rate, fmt.channels, audio_));
+                    fmt.codec, fmt.rate, fmt.channels, audio_)});
                 outStreams.push_back(bplist::dict({
                     {"type", bplist::u(type)},
-                    {"dataPort", bplist::u(audioStreams_.back()->dataPort())},
-                    {"controlPort", bplist::u(audioStreams_.back()->controlPort())},
+                    {"dataPort", bplist::u(audioStreams_.back().stream->dataPort())},
+                    {"controlPort", bplist::u(audioStreams_.back().stream->controlPort())},
                     {"streamConnectionID", bplist::u(scid)},
                 }));
             }
@@ -424,14 +496,76 @@ RtspResponse Session::handleSetup(const RtspRequest& req)
     const uint16_t timingPort   = ntpSock_ ? ntpSock_->port() : 0;
     const uint16_t keepAlivePort = keepAliveSock_ ? keepAliveSock_->port() : 0;
 
+    std::vector<bplist::Ptr> enabledFeatures = {bplist::str("iAPChannel"), bplist::str("viewAreas")};
+    const bool enableAltScreen = info_ && info_->advertiseCluster && clusterVideo_ &&
+                                 clusterWidth_ > 0 && clusterHeight_ > 0;
+    if (enableAltScreen) enabledFeatures.push_back(bplist::str("altScreen"));
+    LOG_INFO("SETUP enabledFeatures=[iAPChannel,viewAreas%s]", enableAltScreen ? ",altScreen" : "");
     std::vector<std::pair<std::string, bplist::Ptr>> d = {
         {"timingPort", bplist::u(timingPort)},
         {"eventPort",  bplist::u(eventPort)},
-        {"enabledFeatures", bplist::array({bplist::str("iAPChannel"), bplist::str("viewAreas")})},
+        {"enabledFeatures", bplist::array(enabledFeatures)},
     };
     if (keepAlivePort) d.push_back({"keepAlivePort", bplist::u(keepAlivePort)});
     r.body = bplist::serialize(bplist::dict(d));
     return r;
+}
+
+RtspResponse Session::handleTeardown(const RtspRequest& req)
+{
+    bplist::NodePtr root;
+    if (!req.body.empty()) {
+        root = bplist::parse(req.body.data(), req.body.size());
+        if (!root || root->type != bplist::NodeType::Dict)
+            return RtspResponse::badRequest();
+    }
+    const auto requested = root ? bplist::dictGet(root, "streams") : nullptr;
+    if (!requested) {
+        LOG_INFO("TEARDOWN: full session");
+        markDisconnected();
+        iapTunnel_.reset();
+        streams_.clear();
+        audioStreams_.clear();
+        return RtspResponse::ok();
+    }
+    if (requested->type != bplist::NodeType::Array) return RtspResponse::badRequest();
+    for (const auto& item : requested->array) {
+        if (!item || item->type != bplist::NodeType::Dict)
+            return RtspResponse::badRequest();
+        const auto type = bplist::dictGet(item, "type");
+        const auto connectionId = bplist::dictGet(item, "streamConnectionID");
+        if (!type && !connectionId) return RtspResponse::badRequest();
+        const auto validInteger = [](const auto& value) {
+            return !value || value->type == bplist::NodeType::Uint ||
+                   (value->type == bplist::NodeType::Int && value->i >= 0);
+        };
+        if (!validInteger(type) || !validInteger(connectionId)) return RtspResponse::badRequest();
+    }
+    bool removedMainScreen = false;
+    for (const auto& item : requested->array) {
+        const auto type = bplist::dictGet(item, "type");
+        const auto connectionId = bplist::dictGet(item, "streamConnectionID");
+        const auto streamId = bplist::dictGet(item, "streamID");
+        const auto matches = [&](const auto& entry) {
+            return (!type || entry.type == bplist::uintOf(type)) &&
+                   (!connectionId || entry.connectionId == bplist::uintOf(connectionId));
+        };
+        LOG_INFO("TEARDOWN: stream type=%llu connectionID=%llu hasType=%d hasID=%d",
+                 (unsigned long long)bplist::uintOf(type),
+                 (unsigned long long)bplist::uintOf(connectionId), bool(type), bool(connectionId));
+        for (const auto& entry : streams_)
+            if (!entry.cluster && matches(entry)) removedMainScreen = true;
+        streams_.erase(std::remove_if(streams_.begin(), streams_.end(), matches), streams_.end());
+        audioStreams_.erase(std::remove_if(audioStreams_.begin(), audioStreams_.end(), matches),
+                            audioStreams_.end());
+        if (iapTunnel_ && (!type || bplist::uintOf(type) == 130) &&
+            (!connectionId || bplist::uintOf(connectionId) == iapConnectionId_) &&
+            (!streamId || bplist::uintOf(streamId) == 1)) iapTunnel_.reset();
+    }
+    if (removedMainScreen && std::none_of(streams_.begin(), streams_.end(),
+                                        [](const auto& entry) { return !entry.cluster; }))
+        markDisconnected();
+    return RtspResponse::ok();
 }
 
 RtspResponse Session::handleCommand(const RtspRequest& req)
@@ -439,7 +573,7 @@ RtspResponse Session::handleCommand(const RtspRequest& req)
     auto root = bplist::parse(req.body.data(), req.body.size());
     const std::string type = root ? bplist::strOf(bplist::dictGet(root, "type")) : "";
     if (type == "forceKeyFrame") {
-        for (auto& s : streams_) s->requestKeyFrame();
+        for (auto& s : streams_) s.stream->requestKeyFrame();
         LOG_INFO("/command forceKeyFrame：已请求关键帧（%zu 个屏幕流）", streams_.size());
     }
     return RtspResponse::ok();

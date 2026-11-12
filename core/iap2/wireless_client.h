@@ -19,6 +19,7 @@
 
 #include "iap2/link.h"
 #include "iap2/wire.h"
+#include "iap2/route_guidance.h"
 #include "mfi/mfi_identity.h"
 #include "port/stream.h"
 
@@ -59,6 +60,7 @@ struct WirelessTriggerConfig {
     std::string mfiDir;       ///< identity/（identity.pk8 + certificate.p7b）
 
     int timeoutMs = 60000;
+    bool runtimeTunnel = false;
 };
 
 enum class TriggerStage {
@@ -102,6 +104,7 @@ private:
     WirelessTriggerConfig cfg_;
     LinkEngine            link_;
     CsmFramer             framer_;
+    RouteGuidance         routeGuidance_;
     std::unique_ptr<mfi::IMfiIdentity> mfi_;
     Progress              progress_;
     StageCb               stageCb_;
@@ -112,6 +115,7 @@ private:
     int postTransportSends_ = 0;
     bool transportSeen_ = false;
     bool startSessionSent_ = false;   ///< 0x4301 已发出（发出后控制循环继续跑，直到断链/超时）
+    bool runtimeReady_ = false;
 };
 
 }  // namespace core::iap2

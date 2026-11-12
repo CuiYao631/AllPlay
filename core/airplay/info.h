@@ -27,14 +27,20 @@ struct DeviceInfo {
     int         width  = 1280;       ///< 主屏宽（向手机协商的目标分辨率）
     int         height = 720;
     int         fps    = 60;
+    int         clusterWidth = 0;
+    int         clusterHeight = 0;
+    int         clusterFps = 30;
+    bool        advertiseCluster = false;
     uint64_t    features = 0x615653AEE2ULL;   ///< CarPlay 特性位（含音频；参照 CarPlay 特性位定义）
 };
 
 /// 生成 /info 的 binary plist
 std::vector<uint8_t> buildInfoPlist(const DeviceInfo& info);
 
-/// 主屏 UUID（协议固定值；副屏 …0002 先不做）
+/// Stable display UUIDs used by capability advertisement and stream routing.
 extern const char* const kMainDisplayUuid;
+extern const char* const kClusterDisplayUuid;
+extern const char* const kClusterMapUrl;
 
 /// version 字符串（sourceVersion / srcvers / protovers 用）
 extern const char* const kSourceVersion;   ///< "370.10"

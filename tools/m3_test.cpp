@@ -14,6 +14,8 @@
 #include "airplay/control_cipher.h"
 #include "airplay/session.h"
 #include "airplay/video_stream.h"
+#include "airplay/iap_tunnel.h"
+#include "bplist/bplist.h"
 #include "crypto/chacha20poly1305.h"
 #include "crypto/ed25519.h"
 #include "crypto/hkdf.h"
@@ -21,6 +23,9 @@
 #include "crypto/tlv8.h"
 #include "crypto/x25519.h"
 #include "platform/device_identity.h"
+#include "iap2/route_guidance.h"
+#include "iap2/wire.h"
+#include "iap2/wired_link.h"
 
 #include "phone_crypto.h"
 
@@ -334,6 +339,11 @@ namespace {
 
 using core::crypto::Tlv;
 
+std::unique_ptr<core::IAudioOutput> makeTeardownAudio();
+std::unique_ptr<core::IUdpSocket> makeTeardownSocket(std::shared_ptr<std::atomic<int>> destroyed);
+std::unique_ptr<core::IVideoOutput> makeDisplayTestVideo(std::shared_ptr<std::atomic<int>> size);
+std::unique_ptr<core::ITcpListener> makeDisplayTestListener();
+
 }  // namespace
 
 void testSessionFlow()
@@ -350,8 +360,55 @@ void testSessionFlow()
     info.name = "AllPlay"; info.deviceId = "AA:BB:CC:DD:EE:FF";
     info.pi = ident.pi; info.pkHex = ident.pkHex;
 
+    {
+        auto encoded = core::airplay::buildInfoPlist(info);
+        auto parsed = core::bplist::parse(encoded.data(), encoded.size());
+        auto displays = core::bplist::dictGet(parsed, "displays");
+        CHECK(displays && displays->array.size() == 1, "Default info advertises only main display");
+        info.clusterWidth = 960;
+        info.clusterHeight = 360;
+          encoded = core::airplay::buildInfoPlist(info);
+          parsed = core::bplist::parse(encoded.data(), encoded.size());
+          displays = core::bplist::dictGet(parsed, "displays");
+          CHECK(displays && displays->array.size() == 1,
+              "Instrument window dimensions alone preserve single-display protocol");
+          info.advertiseCluster = true;
+        encoded = core::airplay::buildInfoPlist(info);
+        parsed = core::bplist::parse(encoded.data(), encoded.size());
+        displays = core::bplist::dictGet(parsed, "displays");
+        CHECK(displays && displays->array.size() == 2, "Cluster mode advertises two displays");
+        const auto cluster = core::bplist::arrGet(displays, 1);
+        CHECK(core::bplist::uintOf(core::bplist::dictGet(cluster, "type")) == 111 &&
+              core::bplist::strOf(core::bplist::dictGet(cluster, "uuid")) == core::airplay::kClusterDisplayUuid &&
+              core::bplist::uintOf(core::bplist::dictGet(cluster, "widthPixels")) == 960 &&
+              core::bplist::uintOf(core::bplist::dictGet(cluster, "heightPixels")) == 360,
+              "Cluster display has independent UUID, type and resolution");
+        const auto primaryInput = core::bplist::dictGet(cluster, "primaryInputDevice");
+        CHECK(primaryInput && primaryInput->type == core::bplist::NodeType::Uint && primaryInput->u == 0 &&
+              core::bplist::strOf(core::bplist::dictGet(cluster, "initialURL")) ==
+                  "maps:/car/instrumentcluster/map" &&
+              core::bplist::uintOf(core::bplist::dictGet(cluster, "widthPhysical")) == 292 &&
+              core::bplist::uintOf(core::bplist::dictGet(cluster, "heightPhysical")) == 110,
+              "Cluster metadata uses numeric input mode, map URL and physical dimensions");
+    }
+
+    auto audio = makeTeardownAudio();
+    auto mainSize = std::make_shared<std::atomic<int>>(0);
+    auto clusterSize = std::make_shared<std::atomic<int>>(0);
+    auto mainVideo = makeDisplayTestVideo(mainSize);
+    auto clusterVideo = makeDisplayTestVideo(clusterSize);
+    auto destroyedSockets = std::make_shared<std::atomic<int>>(0);
+    core::PlatformServices services;
+    services.makeUdpSocket = [destroyedSockets] { return makeTeardownSocket(destroyedSockets); };
+    services.makeTcpListener = [] { return makeDisplayTestListener(); };
     core::airplay::SessionConfig sc;
     sc.identity = &ident; sc.info = &info;
+    sc.services = &services;
+    sc.audio = audio.get();
+    sc.video = mainVideo.get();
+    sc.clusterVideo = clusterVideo.get();
+    sc.clusterWidth = info.clusterWidth;
+    sc.clusterHeight = info.clusterHeight;
     sc.stateDir = "/tmp/allplay-m3-pairing";
     sc.mfiDir.clear();   // 本轮跳过 auth-setup（MFi 签名在 iap2_test 已验）
     core::airplay::Session session(sc);
@@ -481,6 +538,131 @@ void testSessionFlow()
         CHECK(std::equal(ck.readKey.begin(), ck.readKey.end(), readKey.begin()) &&
               std::equal(ck.writeKey.begin(), ck.writeKey.end(), writeKey.begin()),
               "控制密钥 = HKDF(shared, Control-Salt, ...)（read/write 方向交叉）");
+    }
+
+    {
+        core::airplay::RtspRequest request;
+        request.method = "SETUP";
+        request.uri = "/session";
+        request.body = core::bplist::serialize(core::bplist::dict({
+            {"features", core::bplist::array({core::bplist::str("altScreen")})},
+        }));
+        const auto hasAltScreen = [](const core::airplay::RtspResponse& response) {
+            const auto root = core::bplist::parse(response.body.data(), response.body.size());
+            const auto features = core::bplist::dictGet(root, "enabledFeatures");
+            if (!features || features->type != core::bplist::NodeType::Array) return false;
+            return std::any_of(features->array.begin(), features->array.end(), [](const auto& feature) {
+                return core::bplist::strOf(feature) == "altScreen";
+            });
+        };
+        CHECK(hasAltScreen(session.handle(request)), "Experimental cluster SETUP enables altScreen");
+        request.body = core::bplist::serialize(core::bplist::dict({
+            {"streams", core::bplist::array({core::bplist::dict({
+                {"type", core::bplist::u(130)},
+                {"clientTypeUUID", core::bplist::str("E9459FD0-BCAD-4C45-820F-1E72447EF2F2")},
+                {"seed", core::bplist::u(0xffffffffffffffffULL)},
+                {"streamConnectionID", core::bplist::u(300)},
+            })})},
+        }));
+        const auto iapResponse = session.handle(request);
+        const auto iapRoot = core::bplist::parse(iapResponse.body.data(), iapResponse.body.size());
+        const auto iapStream = core::bplist::arrGet(core::bplist::dictGet(iapRoot, "streams"), 0);
+        CHECK(iapResponse.status == 200 && iapStream &&
+              core::bplist::uintOf(core::bplist::dictGet(iapStream, "streamID")) == 1 &&
+              core::bplist::uintOf(core::bplist::dictGet(iapStream, "dataPort")) == 54321,
+              "iAP SETUP returns runtime stream ID and real data port for unsigned seed");
+        request.method = "TEARDOWN";
+        request.body = core::bplist::serialize(core::bplist::dict({
+            {"streams", core::bplist::array({core::bplist::dict({
+                {"type", core::bplist::u(130)}, {"streamID", core::bplist::u(1)},
+            })})},
+        }));
+        CHECK(session.handle(request).status == 200, "iAP runtime tunnel can be torn down independently");
+        request.method = "SETUP";
+        request.body = core::bplist::serialize(core::bplist::dict({
+            {"features", core::bplist::array({core::bplist::str("altScreen")})},
+        }));
+        {
+            auto singleInfo = info;
+            singleInfo.advertiseCluster = false;
+            auto singleConfig = sc;
+            singleConfig.info = &singleInfo;
+            singleConfig.services = nullptr;
+            core::airplay::Session singleSession(singleConfig);
+            CHECK(!hasAltScreen(singleSession.handle(request)),
+                  "Window-only SETUP does not enable altScreen even when phone proposes it");
+        }
+        request.method = "RECORD";
+        request.body.clear();
+        CHECK(session.handle(request).status == 200 && session.sessionActive(),
+              "RECORD activates session");
+        request.method = "SETUP";
+        request.body = core::bplist::serialize(core::bplist::dict({
+            {"streams", core::bplist::array({
+                core::bplist::dict({{"type", core::bplist::u(110)},
+                                   {"streamConnectionID", core::bplist::u(200)}}),
+                core::bplist::dict({{"type", core::bplist::u(111)},
+                                   {"displayUUID", core::bplist::str(core::airplay::kClusterDisplayUuid)},
+                                   {"streamConnectionID", core::bplist::u(201)}}),
+            })},
+        }));
+        CHECK(session.handle(request).status == 200, "SETUP accepts independent main and cluster streams");
+        for (int attempt = 0; attempt < 100 && (!mainSize->load() || !clusterSize->load()); ++attempt)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        CHECK(mainSize->load() == 12800720 && clusterSize->load() == 9600360,
+              "Display routing configures separate outputs with independent dimensions");
+        request.method = "TEARDOWN";
+        request.body = core::bplist::serialize(core::bplist::dict({
+            {"streams", core::bplist::array({core::bplist::dict({{"type", core::bplist::u(111)}})})},
+        }));
+        CHECK(session.handle(request).status == 200 && session.sessionActive(),
+              "Closing instrument stream preserves main session");
+          request.method = "SETUP";
+          request.body = core::bplist::serialize(core::bplist::dict({
+            {"streams", core::bplist::array({
+                core::bplist::dict({{"type", core::bplist::u(100)},
+                             {"streamConnectionID", core::bplist::u(0x800000000000007bULL)}}),
+                core::bplist::dict({{"type", core::bplist::u(102)},
+                             {"streamConnectionID", core::bplist::u(124)}}),
+            })},
+          }));
+          const auto setupResponse = session.handle(request);
+          const auto setupRoot = core::bplist::parse(setupResponse.body.data(), setupResponse.body.size());
+          const auto setupStreams = core::bplist::dictGet(setupRoot, "streams");
+          CHECK(setupResponse.status == 200 && setupStreams && setupStreams->array.size() == 2,
+              "SETUP creates two independent audio streams");
+        request.method = "TEARDOWN";
+        request.body = core::bplist::serialize(core::bplist::dict({
+            {"streams", core::bplist::array({core::bplist::dict({
+                {"type", core::bplist::u(100)},
+                {"streamConnectionID", core::bplist::u(0x800000000000007bULL)},
+            })})},
+        }));
+        CHECK(session.handle(request).status == 200 && session.sessionActive() && !session.connecting(),
+              "Audio-only TEARDOWN preserves active session");
+        CHECK(destroyedSockets->load() == 2, "TEARDOWN closes only matching audio stream sockets");
+        CHECK(session.handle(request).status == 200 && destroyedSockets->load() == 2,
+              "Repeated TEARDOWN leaves other streams intact");
+        request.body = core::bplist::serialize(core::bplist::dict({
+            {"streams", core::bplist::array({core::bplist::dict({
+                {"type", core::bplist::str("102")},
+            })})},
+        }));
+        CHECK(session.handle(request).status == 400 && destroyedSockets->load() == 2,
+              "Invalid stream selector does not remove streams");
+        request.body = core::bplist::serialize(core::bplist::dict({
+            {"streams", core::bplist::array({core::bplist::dict({
+                {"streamConnectionID", core::bplist::u(124)},
+            })})},
+        }));
+        CHECK(session.handle(request).status == 200 && session.sessionActive() &&
+              destroyedSockets->load() == 4, "ID-only TEARDOWN removes selected stream without ending session");
+        request.body = {0xff};
+        CHECK(session.handle(request).status == 400 && session.sessionActive(),
+              "Malformed TEARDOWN does not disconnect session");
+        request.body.clear();
+        CHECK(session.handle(request).status == 200 && !session.sessionActive() && !session.connecting(),
+              "Full TEARDOWN disconnects session");
     }
 
     if (cpriv) EVP_PKEY_free(cpriv);
@@ -667,6 +849,48 @@ struct MockAudioOut : public core::IAudioOutput {
     void reset() override {}
 };
 
+std::unique_ptr<core::IAudioOutput> makeTeardownAudio()
+{
+    return std::make_unique<MockAudioOut>();
+}
+
+std::unique_ptr<core::IUdpSocket> makeTeardownSocket(std::shared_ptr<std::atomic<int>> destroyed)
+{
+    struct TrackedUdp : MockUdp {
+        explicit TrackedUdp(std::shared_ptr<std::atomic<int>> counter) : destroyed(std::move(counter)) {}
+        ~TrackedUdp() override { ++*destroyed; }
+        std::shared_ptr<std::atomic<int>> destroyed;
+    };
+    return std::make_unique<TrackedUdp>(std::move(destroyed));
+}
+
+std::unique_ptr<core::IVideoOutput> makeDisplayTestVideo(std::shared_ptr<std::atomic<int>> size)
+{
+    struct DisplayVideo : MockVideo {
+        explicit DisplayVideo(std::shared_ptr<std::atomic<int>> value) : dimensions(std::move(value)) {}
+        void configure(core::VideoCodec codec, int width, int height,
+                       const std::vector<uint8_t>& data) override
+        {
+            MockVideo::configure(codec, width, height, data);
+            dimensions->store(width * 10000 + height);
+        }
+        std::shared_ptr<std::atomic<int>> dimensions;
+    };
+    return std::make_unique<DisplayVideo>(std::move(size));
+}
+
+std::unique_ptr<core::ITcpListener> makeDisplayTestListener()
+{
+    auto listener = std::make_unique<MockListener>();
+    listener->stream = std::make_unique<MockStream>();
+    listener->stream->buf.resize(128, 0);
+    listener->stream->buf[0] = 8;
+    listener->stream->buf[4] = 1;
+    const std::vector<uint8_t> config = {'a', 'v', 'c', 'C', 1, 0x64, 0, 0x1f};
+    listener->stream->buf.insert(listener->stream->buf.end(), config.begin(), config.end());
+    return listener;
+}
+
 }  // namespace
 
 void testAudioReorder()
@@ -746,6 +970,157 @@ void testAudioReorder()
 
 int main()
 {
+    {
+        struct IdentificationPhone : core::IByteStream {
+            core::iap2::LinkEngine link{core::iap2::wiredLinkConfig()};
+            core::iap2::CsmFramer frames;
+            std::vector<uint8_t> pending;
+            bool requested = false;
+            bool identified = false;
+            bool subscribed = false;
+            int idleReads = 0;
+            IdentificationPhone() { link.start(core::iap2::monoMs()); }
+            void process() {
+                if (link.ready() && !requested) {
+                    requested = true;
+                    link.sendControl(core::iap2::csmFrame(0x1d00, {}), core::iap2::monoMs());
+                }
+                std::vector<uint8_t> control;
+                while (link.nextControl(&control)) frames.feed(control.data(), control.size());
+                uint16_t messageId = 0;
+                std::vector<uint8_t> body;
+                while (frames.next(&messageId, &body)) {
+                    if (messageId == 0x1d01) {
+                        identified = true;
+                        link.sendControl(core::iap2::csmFrame(0x1d02, {}), core::iap2::monoMs());
+                    }
+                    if (messageId == 0x5200) {
+                        std::vector<core::iap2::Param> params;
+                        core::iap2::parseParams(body.data(), body.size(), &params);
+                        const auto component = core::iap2::findParam(params, 0);
+                        subscribed = component && core::iap2::paramU16(*component) == 42;
+                    }
+                }
+            }
+            bool writeAll(const uint8_t* bytes, size_t count) override {
+                link.feed(bytes, count, core::iap2::monoMs());
+                process();
+                return !link.dead();
+            }
+            int read(uint8_t* bytes, size_t count, int) override {
+                process();
+                link.tick(core::iap2::monoMs());
+                link.takeOutput(&pending);
+                if (pending.empty()) {
+                    if (subscribed && ++idleReads > 2) return -1;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    return 0;
+                }
+                const size_t received = std::min(count, pending.size());
+                std::memcpy(bytes, pending.data(), received);
+                pending.erase(pending.begin(), pending.begin() + received);
+                return int(received);
+            }
+        };
+        IdentificationPhone phone;
+        core::iap2::WirelessTriggerConfig config;
+        config.runtimeTunnel = true;
+        config.timeoutMs = 1000;
+        core::iap2::WirelessTrigger runtime(&phone, config);
+        runtime.run();
+        CHECK(phone.identified && phone.subscribed,
+              "Runtime peer receives identification CSM and route subscription after acceptance");
+    }
+        {
+            struct CaptureStream : core::IByteStream {
+                std::vector<uint8_t> sent;
+                int read(uint8_t*, size_t, int) override { return -1; }
+                bool writeAll(const uint8_t* bytes, size_t count) override {
+                    sent.insert(sent.end(), bytes, bytes + count);
+                    return true;
+                }
+            };
+            core::iap2::WirelessTriggerConfig config;
+            config.runtimeTunnel = true;
+            CaptureStream tunnel;
+            core::iap2::WirelessTrigger runtime(&tunnel, config);
+            runtime.run();
+            core::iap2::LinkEngine expected{core::iap2::wiredLinkConfig()};
+            expected.start(0);
+            std::vector<uint8_t> initial;
+            expected.takeOutput(&initial);
+            CHECK(tunnel.sent == initial && initial.size() > 6,
+                        "Runtime iAP tunnel initiates SYN with reliable zero-ack version-2 configuration");
+            config.runtimeTunnel = false;
+            CaptureStream bluetooth;
+            core::iap2::WirelessTrigger bootstrap(&bluetooth, config);
+            bootstrap.run();
+            CHECK(bluetooth.sent.size() == 6, "Bluetooth bootstrap still waits for phone synchronization");
+        }
+    {
+      core::airplay::IapPackageFramer packages;
+      core::iap2::Params maneuver;
+      maneuver.u16(1, 7).u8(3, 2).str(4, "Main Street");
+      const auto message = core::iap2::csmFrame(0x5202, maneuver.encode());
+      std::vector<uint8_t> package(32, 0);
+      const uint32_t size = uint32_t(package.size() + message.size());
+      package[0] = uint8_t(size >> 24); package[1] = uint8_t(size >> 16);
+      package[2] = uint8_t(size >> 8); package[3] = uint8_t(size);
+      package[16] = 'c'; package[17] = 'o'; package[18] = 'm'; package[19] = 'm';
+      package.insert(package.end(), message.begin(), message.end());
+      std::vector<uint8_t> decoded;
+      CHECK(packages.feed(package.data(), 15) && !packages.next(&decoded),
+          "iAP transport buffers partial package header");
+      CHECK(packages.feed(package.data() + 15, package.size() - 15) && packages.next(&decoded) &&
+          decoded == message, "iAP transport extracts original CSM from fragmented comm package");
+    std::vector<uint8_t> secret(32, 0x42);
+    const auto key = core::crypto::hkdfSha512(secret, "DataStream-Salt18446744073709551615",
+                                 "DataStream-Output-Encryption-Key", 32);
+    core::airplay::ControlCipher sender(key.data(), key.data()), receiver(key.data(), key.data());
+    const auto encrypted = sender.encrypt(package.data(), package.size());
+    receiver.feed(encrypted.data(), encrypted.size() / 2);
+    std::vector<uint8_t> plaintext;
+    CHECK(!receiver.next(&plaintext), "iAP encrypted transport buffers split ChaCha frame");
+    receiver.feed(encrypted.data() + encrypted.size() / 2, encrypted.size() - encrypted.size() / 2);
+    core::airplay::IapPackageFramer decryptedPackages;
+    CHECK(receiver.next(&plaintext) && decryptedPackages.feed(plaintext.data(), plaintext.size()) &&
+        decryptedPackages.next(&decoded) && decoded == message,
+        "iAP encrypted transport decrypts seeded package without modifying CSM bytes");
+      std::vector<uint8_t> invalid(32, 0);
+      CHECK(packages.feed(invalid.data(), invalid.size()) && !packages.next(&decoded) && packages.failed(),
+          "iAP transport rejects invalid package lengths");
+    }
+    {
+      core::iap2::RouteGuidance route;
+      core::iap2::Params update;
+    update.u8(1, 1).u32(0x0a, 350).u32(7, 5400).u16List(0x0d, {7})
+        .bytes(6, {0, 0, 0, 0, 0, 0, 0x0e, 0x10});
+      CHECK(route.accept(0x5201, update.encode()) && !route.current(),
+          "TBT waits for maneuver details instead of guessing direction");
+      core::iap2::Params maneuver;
+      maneuver.u16(1, 7).u8(3, 1).str(4, "Main Street\nInjected");
+      CHECK(route.accept(0x5202, maneuver.encode()), "TBT parses maneuver details");
+      const auto current = route.current();
+      CHECK(current && current->action == "left" && current->distanceMeters == 350 &&
+          current->remainingMeters == 5400 && current->remainingSeconds == 3600 &&
+          current->road == "Main Street Injected",
+          "TBT combines cached turn, road and distance and sanitizes log text");
+    CHECK(!route.accept(0x5201, {0, 3, 0, 1}) && route.current() && route.current()->action == "left",
+          "Malformed TBT does not corrupt active guidance");
+      CHECK(core::iap2::RouteGuidance::actionName(2) == "right" &&
+          core::iap2::RouteGuidance::actionName(3) == "straight" &&
+          core::iap2::RouteGuidance::actionName(255) == "unknown",
+          "TBT distinguishes right, straight and unknown Apple maneuver types");
+        core::iap2::Params emptyCurrent;
+        emptyCurrent.u16List(0x0d, {});
+        CHECK(route.accept(0x5201, emptyCurrent.encode()) && !route.current(),
+            "Empty maneuver list does not report stale current instruction");
+        CHECK(route.accept(0x5201, update.encode()) && route.current() && route.current()->action == "left",
+            "TBT retains cached maneuver details across temporary empty list");
+      core::iap2::Params ended;
+      ended.u8(1, 2);
+      CHECK(route.accept(0x5201, ended.encode()) && !route.current(), "Arrival clears TBT cache");
+    }
     testTlv8();
     testChaCha();
     testHkdf();

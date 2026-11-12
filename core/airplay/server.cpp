@@ -60,6 +60,9 @@ bool Receiver::start(const ReceiverConfig& cfg, const core::PlatformServices& se
     info_.width    = cfg_.width;
     info_.height   = cfg_.height;
     info_.fps      = cfg_.fps;
+    info_.clusterWidth = cfg_.clusterVideo ? cfg_.clusterWidth : 0;
+    info_.clusterHeight = cfg_.clusterVideo ? cfg_.clusterHeight : 0;
+    info_.advertiseCluster = cfg_.advertiseCluster && cfg_.clusterVideo;
 
     // ---- 5) 会话（pair-setup/verify、auth-setup、SETUP）----
     SessionConfig sc;
@@ -75,6 +78,10 @@ bool Receiver::start(const ReceiverConfig& cfg, const core::PlatformServices& se
     sc.audio    = cfg_.audio;
     sc.width    = cfg_.width;
     sc.height   = cfg_.height;
+    sc.clusterVideo = cfg_.clusterVideo;
+    sc.clusterWidth = info_.clusterWidth;
+    sc.clusterHeight = info_.clusterHeight;
+    sc.wirelessSsid = cfg_.wirelessSsid;
     session_ = std::make_unique<Session>(sc);
 
     // ---- 6) RTSP 服务器（端口被占自动往后退）----
@@ -156,6 +163,7 @@ void Receiver::stop()
 {
     if (bonjour_) { bonjour_->stop(); bonjour_.reset(); }
     if (rtsp_)    { rtsp_->stop();    rtsp_.reset(); }
+    session_.reset();
 }
 
 }  // namespace core::airplay

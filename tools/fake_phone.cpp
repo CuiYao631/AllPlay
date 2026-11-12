@@ -32,6 +32,7 @@
 //   build/allplay_host &
 //   build/fake_phone --h264 out.h264 --fps 60
 #include "airplay/control_cipher.h"
+#include "airplay/info.h"
 #include "bplist/bplist.h"
 #include "crypto/hkdf.h"
 #include "crypto/tlv8.h"
@@ -371,6 +372,7 @@ struct Options {
     std::string host = "127.0.0.1";
     uint16_t    port = 7000;
     std::string h264;
+    std::string clusterH264;
     std::string aac;               ///< --aac：ADTS 裸流，建音频流并推（不验音频就不给）
     int         fps    = 30;
     bool        loop   = false;
@@ -387,6 +389,7 @@ void printUsage(const char* argv0)
     std::printf(
         "用法: %s --h264 FILE [选项]\n"
         "  --h264 PATH     裸 AnnexB H.264 基本流（推给宿主当屏幕流）\n"
+        "  --cluster-h264 PATH  Independent instrument test stream (experimental)\n"
         "  --host IP       宿主地址（默认 127.0.0.1）\n"
         "  --port N        宿主 RTSP 端口（默认 7000）\n"
         "  --fps N         推流帧率（默认 30）\n"
@@ -415,6 +418,7 @@ bool parseArgs(int argc, char** argv, Options* o)
             return argv[++i];
         };
         if (!std::strcmp(a, "--h264"))            o->h264 = need(a);
+        else if (!std::strcmp(a, "--cluster-h264")) o->clusterH264 = need(a);
         else if (!std::strcmp(a, "--aac"))        o->aac = need(a);
         else if (!std::strcmp(a, "--host"))       o->host = need(a);
         else if (!std::strcmp(a, "--port"))       o->port = uint16_t(std::atoi(need(a)));
@@ -641,6 +645,25 @@ int main(int argc, char** argv)
         std::printf("[phone] ⚠️ 首帧不是 IDR：宿主的闸门会丢弃它之后的非关键帧，"
                     "请用 -g 较小的参数重编（如 -g 30）\n");
 
+    std::vector<ScreenFrame> clusterFrames;
+    std::vector<uint8_t> clusterCodecData;
+    if (!opt.clusterH264.empty()) {
+        std::vector<uint8_t> clusterFile;
+        if (!readFile(opt.clusterH264, &clusterFile)) return 1;
+        const auto clusterNals = allplay::annexb::scanNals(clusterFile);
+        if (!allplay::annexb::buildAvcC(clusterFile, clusterNals, &clusterCodecData, &err)) {
+            std::fprintf(stderr, "[phone] Instrument codec data: %s\n", err.c_str());
+            return 1;
+        }
+        for (const auto& range : allplay::annexb::splitAus(clusterFile, clusterNals)) {
+            std::vector<uint8_t> accessUnit(clusterFile.begin() + range.first, clusterFile.begin() + range.second);
+            ScreenFrame frame;
+            frame.avcc = allplay::annexb::toAvcc(accessUnit);
+            if (!frame.avcc.empty()) clusterFrames.push_back(std::move(frame));
+        }
+        if (clusterFrames.empty()) return 1;
+    }
+
     const std::string baseUri = "rtsp://" + opt.host + ":" + std::to_string(opt.port);
 
     // ---- 1) OPTIONS ----
@@ -669,6 +692,18 @@ int main(int argc, char** argv)
         const std::string name = root ? core::bplist::strOf(core::bplist::dictGet(root, "name")) : "";
         std::printf("[phone] GET /info → %d，设备名 \"%s\"，%zu 字节 bplist\n",
                     resp.status, name.c_str(), resp.body.size());
+        if (!clusterFrames.empty()) {
+            const auto displays = core::bplist::dictGet(root, "displays");
+            bool foundCluster = false;
+            if (displays)
+                for (const auto& display : displays->array)
+                    if (core::bplist::strOf(core::bplist::dictGet(display, "uuid")) ==
+                        core::airplay::kClusterDisplayUuid) foundCluster = true;
+            if (!foundCluster) {
+                std::fprintf(stderr, "[phone] Host does not advertise instrument display; use --cluster-screen\n");
+                return 1;
+            }
+        }
     }
 
     // ---- 3) POST /pair-setup（SRP-6a，PIN 3939）----
@@ -895,8 +930,9 @@ int main(int argc, char** argv)
     }
     const bool wantAudio = !aac.frames.empty();
 
-    uint16_t eventPort = 0, dataPort = 0, audioPort = 0;
+    uint16_t eventPort = 0, dataPort = 0, audioPort = 0, clusterPort = 0;
     const uint64_t scid = 1234;
+    const uint64_t clusterScid = 4321;
     // 音频用**另一个** scid：密钥是从 scid 派生的，复用就等于两路流同一把钥匙
     const uint64_t audioScid = 5678;
     {
@@ -938,6 +974,13 @@ int main(int argc, char** argv)
                 {"streamConnectionID", core::bplist::u(audioScid)},
             }));
         }
+        if (!clusterFrames.empty()) {
+            streamList.push_back(core::bplist::dict({
+                {"type", core::bplist::u(111)},
+                {"displayUUID", core::bplist::str(core::airplay::kClusterDisplayUuid)},
+                {"streamConnectionID", core::bplist::u(clusterScid)},
+            }));
+        }
         auto b2 = core::bplist::dict({{"streams", core::bplist::array(streamList)}});
         if (!rtsp.request("SETUP", baseUri + "/stream", "application/x-apple-binary-plist",
                           core::bplist::serialize(b2), &resp, &err)) {
@@ -954,12 +997,17 @@ int main(int argc, char** argv)
             const uint16_t dp   = uint16_t(core::bplist::uintOf(core::bplist::dictGet(s, "dataPort")));
             const uint64_t type = core::bplist::uintOf(core::bplist::dictGet(s, "type"));
             if (type == 110)                        dataPort  = dp;
+            else if (type == 111)                   clusterPort = dp;
             else if (type >= 100 && type <= 102)    audioPort = dp;
         }
         std::printf("[phone] SETUP#2 → 屏幕流 dataPort=%u（scid=%llu）\n", dataPort,
                     (unsigned long long)scid);
         if (!dataPort) {
             std::fprintf(stderr, "[phone] 宿主没给屏幕流 dataPort\n");
+            return 1;
+        }
+        if (!clusterFrames.empty() && !clusterPort) {
+            std::fprintf(stderr, "[phone] No instrument dataPort; start host with --cluster-screen\n");
             return 1;
         }
         if (wantAudio) {
@@ -1002,6 +1050,28 @@ int main(int argc, char** argv)
 
     auto streamKey = core::crypto::hkdfSha512(shared, "DataStream-Salt" + std::to_string(scid),
                                               "DataStream-Output-Encryption-Key", 32);
+
+    Link clusterScreen;
+    std::vector<uint8_t> clusterKey;
+    if (!clusterFrames.empty()) {
+        if (!clusterScreen.connectTo(opt.host, clusterPort, "Instrument stream", &err)) {
+            std::fprintf(stderr, "[phone] %s\n", err.c_str());
+            touchStop.store(true);
+            if (touchThread.joinable()) touchThread.join();
+            return 1;
+        }
+        clusterKey = core::crypto::hkdfSha512(shared, "DataStream-Salt" + std::to_string(clusterScid),
+                                             "DataStream-Output-Encryption-Key", 32);
+        std::vector<uint8_t> body = {'a', 'v', 'c', 'C'};
+        body.insert(body.end(), clusterCodecData.begin(), clusterCodecData.end());
+        auto wire = makeHeader(uint32_t(body.size()), 1);
+        wire.insert(wire.end(), body.begin(), body.end());
+        if (!clusterScreen.writeAll(wire.data(), wire.size())) {
+            touchStop.store(true);
+            if (touchThread.joinable()) touchThread.join();
+            return 1;
+        }
+    }
 
     // ---- 音频线程：RTP over UDP，与屏幕流**同时**跑 ----
     // wire = [12B RTP 头][密文][16B tag][8B nonce 尾]，AAD = 头[4..12]（timestamp+SSRC）。
@@ -1115,6 +1185,18 @@ int main(int argc, char** argv)
             ok = false;
             break;
         }
+        if (!clusterFrames.empty()) {
+            const auto& clusterFrame = clusterFrames[sent % clusterFrames.size()];
+            auto clusterHeader = makeHeader(uint32_t(clusterFrame.avcc.size() + 16), 0);
+            auto clusterSealed = core::crypto::chachaSeal(clusterKey.data(), core::crypto::nonce64(sent),
+                                                         clusterHeader.data(), clusterHeader.size(),
+                                                         clusterFrame.avcc.data(), clusterFrame.avcc.size());
+            clusterHeader.insert(clusterHeader.end(), clusterSealed.begin(), clusterSealed.end());
+            if (!clusterScreen.writeAll(clusterHeader.data(), clusterHeader.size())) {
+                ok = false;
+                break;
+            }
+        }
         ++sent;
 
         if (opt.frames > 0 && sent >= size_t(opt.frames)) break;
@@ -1138,6 +1220,7 @@ int main(int argc, char** argv)
     std::printf("[phone] 推流结束：%zu 帧 / %lld ms（%.1f fps）\n", sent,
                 (long long)elapsed,
                 elapsed > 0 ? double(sent) * 1000.0 / double(elapsed) : 0.0);
+    if (!clusterFrames.empty()) std::printf("[phone] Instrument stream sent %zu independent frames\n", sent);
 
     if (audioThread.joinable()) {
         audioStop.store(true);
@@ -1161,5 +1244,5 @@ int main(int argc, char** argv)
     }
 
     if (cpriv) EVP_PKEY_free(cpriv);
-    return sent > 0 ? 0 : 1;
+    return ok && sent > 0 ? 0 : 1;
 }

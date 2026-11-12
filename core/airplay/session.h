@@ -17,6 +17,7 @@
 #include "airplay/control_cipher.h"
 #include "airplay/event_channel.h"
 #include "airplay/info.h"
+#include "airplay/iap_tunnel.h"
 #include "airplay/rtsp.h"
 #include "airplay/video_stream.h"
 #include "crypto/srp6a.h"
@@ -46,6 +47,10 @@ struct SessionConfig {
     core::IAudioOutput*         audio = nullptr;      ///< 音频输出（解码+播放）
     int                         width = 1280;         ///< 协商分辨率
     int                         height = 720;
+    core::IVideoOutput* clusterVideo = nullptr;
+    int clusterWidth = 0;
+    int clusterHeight = 0;
+    std::string wirelessSsid;
 };
 
 class Session {
@@ -77,11 +82,12 @@ public:
     void markDisconnected();
 
 private:
-    RtspResponse handleInfo();
+    RtspResponse handleInfo(const RtspRequest& req);
     RtspResponse handleAuthSetup(const RtspRequest& req);
     RtspResponse handlePairSetup(const RtspRequest& req);
     RtspResponse handlePairVerify(const RtspRequest& req);
     RtspResponse handleSetup(const RtspRequest& req);
+    RtspResponse handleTeardown(const RtspRequest& req);
     RtspResponse handleCommand(const RtspRequest& req);
 
     RtspResponse tlv8Response(const std::vector<uint8_t>& body);
@@ -100,9 +106,23 @@ private:
     const core::PlatformServices* services_ = nullptr;
     core::IVideoOutput*         video_ = nullptr;
     core::IAudioOutput*         audio_ = nullptr;
+    core::IVideoOutput*         clusterVideo_ = nullptr;
+    int clusterWidth_ = 0;
+    int clusterHeight_ = 0;
     int                         width_ = 1280, height_ = 720;
-    std::vector<std::unique_ptr<ScreenStream>> streams_;
-    std::vector<std::unique_ptr<AudioStream>> audioStreams_;
+    struct ScreenEntry {
+        uint64_t type;
+        uint64_t connectionId;
+        bool cluster;
+        std::unique_ptr<ScreenStream> stream;
+    };
+    struct AudioEntry {
+        uint64_t type;
+        uint64_t connectionId;
+        std::unique_ptr<AudioStream> stream;
+    };
+    std::vector<ScreenEntry> streams_;
+    std::vector<AudioEntry> audioStreams_;
 
     // pair-setup
     std::unique_ptr<crypto::Srp6aServer> srp_;
@@ -120,6 +140,10 @@ private:
     bool connecting_ = false;   ///< 已收到过 RTSP 请求（表示 iPhone 正在连接）
 
     std::unique_ptr<EventChannel> eventChannel_;
+    std::unique_ptr<IapTunnel> iapTunnel_;
+    uint64_t iapConnectionId_ = 0;
+    std::string mfiDir_;
+    std::string wirelessSsid_;
 
     std::unique_ptr<core::IUdpSocket> ntpSock_;
     std::thread       ntpThread_;

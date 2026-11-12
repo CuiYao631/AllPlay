@@ -1,4 +1,5 @@
 #include "iap2/wireless_client.h"
+#include "iap2/wired_link.h"
 
 #include "common/log.h"
 
@@ -69,7 +70,8 @@ uint64_t nowMs()
 }  // namespace
 
 WirelessTrigger::WirelessTrigger(IByteStream* stream, WirelessTriggerConfig cfg)
-    : stream_(stream), cfg_(std::move(cfg))
+        : stream_(stream), cfg_(std::move(cfg)),
+            link_(cfg_.runtimeTunnel ? wiredLinkConfig() : LinkConfig())
 {
 }
 
@@ -91,13 +93,19 @@ void WirelessTrigger::sendMessage(uint16_t msgId, const Params& params)
 {
     auto body = params.encode();
     auto frame = csmFrame(msgId, body);
+    if (cfg_.runtimeTunnel) {
+        LOG_INFO("[TBT] runtime enqueue msg=0x%04x csmBytes=%zu linkReady=%d peer=%s",
+                 msgId, frame.size(), link_.ready(), link_.peerSummary().c_str());
+    }
 
     // 按对端可承载的大小分片进链路（协议上 CSM 帧可以跨多个链路载荷）
     const size_t maxChunk = link_.peerMaxPayload();
     for (size_t off = 0; off < frame.size(); off += maxChunk) {
         const size_t n = std::min(maxChunk, frame.size() - off);
-        link_.sendControl(std::vector<uint8_t>(frame.begin() + off, frame.begin() + off + n),
-                          nowMs());
+        if (!link_.sendControl(std::vector<uint8_t>(frame.begin() + off, frame.begin() + off + n), nowMs())) {
+            error_ = "iAP2 control message could not be queued";
+            return;
+        }
     }
 }
 
@@ -133,14 +141,22 @@ void WirelessTrigger::sendIdentification()
         .str(12, cfg_.language)
         .strList(13, {cfg_.language});
     if (mac.size() == 6) body.group(17, g17);
-    body.group(24, g24).group(30, g30);
+    if (!cfg_.runtimeTunnel || !cfg_.ssid.empty()) body.group(24, g24);
+    body.group(30, g30);
 
     sendMessage(kIdentificationInformation, body);
-    log("iAP2 已发识别信息（0x1D01）");
+    if (error_.empty()) log("iAP2 识别信息已入发送队列（0x1D01）");
 }
 
 void WirelessTrigger::sendSubscriptions()
 {
+    if (cfg_.runtimeTunnel) {
+        Params route;
+        route.u16(0, 42).voidv(1).voidv(2);
+        sendMessage(kStartRouteGuidanceUpdates, route);
+        log("Runtime iAP2 subscribed to route guidance (0x5200)");
+        return;
+    }
     Params nowPlaying;
     Params np0, np1;
     for (int id : {1, 4, 6, 12, 26}) np0.voidv(uint16_t(id));
@@ -203,6 +219,12 @@ void WirelessTrigger::sendStartSession()
 
 void WirelessTrigger::handleMessage(uint16_t msgId, const std::vector<uint8_t>& body)
 {
+    if (cfg_.runtimeTunnel && (msgId == kCarPlayAvailability || msgId == kRequestAccessoryWifiConfig ||
+                               msgId == kDeviceTransportIdentifier || msgId == kWirelessCarPlayUpdate)) return;
+    if (msgId == 0x5201 || msgId == 0x5202) {
+        routeGuidance_.accept(msgId, body);
+        return;
+    }
     std::vector<Param> params;
     parseParams(body.data(), body.size(), &params);
 
@@ -215,7 +237,19 @@ void WirelessTrigger::handleMessage(uint16_t msgId, const std::vector<uint8_t>& 
     case kIdentificationAccepted:
         log("iAP2 rx=0x1d02 识别被接受");
         setStage(TriggerStage::Identified);
+        if (cfg_.runtimeTunnel) {
+            runtimeReady_ = true;
+            sendSubscriptions();
+            log("Runtime iAP2 identified; TBT subscriptions active");
+        }
         break;
+
+    case 0x1d03:
+        LOG_WARN("[TBT] iAP2 identification rejected; parameter count=%zu", params.size());
+        for (const auto& param : params)
+            LOG_WARN("[TBT] rejected identification parameter id=%u bytes=%zu", param.id, param.payload.size());
+        error_ = "iAP2 identification rejected (0x1D03)";
+        return;
 
     case kRequestAuthenticationCert: {
         log("iAP2 rx=0xaa00 请求证书");
@@ -295,6 +329,10 @@ void WirelessTrigger::handleMessage(uint16_t msgId, const std::vector<uint8_t>& 
     default: {
         char id[8];
         std::snprintf(id, sizeof id, "%04x", msgId);
+        if (cfg_.runtimeTunnel) {
+            log(std::string("Runtime iAP2 rx=0x") + id + " bytes=" + std::to_string(body.size()));
+            break;
+        }
         std::string hex;
         for (uint8_t b : body) {
             char buf[3];
@@ -315,6 +353,7 @@ bool WirelessTrigger::run()
     postTransportSends_ = 0;
     transportSeen_ = false;
     startSessionSent_ = false;
+    runtimeReady_ = false;
 
     if (!cfg_.mfiDir.empty()) {
         std::string err;
@@ -333,20 +372,20 @@ bool WirelessTrigger::run()
     log("iAP2 链路启动（等 marker…）");
 
     uint8_t buf[4096];
-    while (nowMs() < deadline) {
+    while (nowMs() < deadline || (cfg_.runtimeTunnel && runtimeReady_)) {
         link_.tick(nowMs());
 
         std::vector<uint8_t> out;
         if (link_.takeOutput(&out)) {
             if (!stream_->writeAll(out.data(), out.size())) {
                 error_ = "RFCOMM 写失败";
-                return startSessionSent_;
+                return startSessionSent_ || runtimeReady_;
             }
         }
 
         if (link_.dead()) {
             error_ = "链路判死：" + link_.deadReason();
-            return startSessionSent_;
+            return startSessionSent_ || runtimeReady_;
         }
 
         std::vector<uint8_t> ctrl;
@@ -356,18 +395,23 @@ bool WirelessTrigger::run()
             std::vector<uint8_t> body;
             while (framer_.next(&msgId, &body)) {
                 handleMessage(msgId, body);
-                if (!error_.empty()) return startSessionSent_;
+                if (!error_.empty()) return startSessionSent_ || runtimeReady_;
             }
         }
 
         const int n = stream_->read(buf, sizeof buf, 100);
         if (n < 0) {
             error_ = "RFCOMM 断开";
-            return startSessionSent_;
+            return startSessionSent_ || runtimeReady_;
         }
         if (n > 0) link_.feed(buf, size_t(n), nowMs());
     }
 
+    if (cfg_.runtimeTunnel) {
+        error_ = "Runtime iAP2 identification/authentication timed out; stage=" +
+                 std::to_string(static_cast<int>(stage_)) + " peer=" + link_.peerSummary();
+        return runtimeReady_;
+    }
     if (!startSessionSent_)
         error_ = "触发超时（" + std::to_string(cfg_.timeoutMs) + "ms 内未到 0x4301）";
     return startSessionSent_;

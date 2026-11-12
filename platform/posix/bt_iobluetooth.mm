@@ -48,10 +48,27 @@ struct ServerWait {
 @property(nonatomic, assign) allplay::posix::MacRfcommStream* owner;
 @end
 
+@interface SdpQueryDelegate : NSObject
+@property(nonatomic, assign) BOOL done;
+@property(nonatomic, assign) IOReturn queryStatus;
+@property(nonatomic, assign) BOOL releaseOnCompletion;
+- (void)sdpQueryComplete:(IOBluetoothDevice*)device status:(IOReturn)queryStatus;
+@end
+
+@implementation SdpQueryDelegate
+- (void)sdpQueryComplete:(IOBluetoothDevice*)device status:(IOReturn)queryStatus
+{
+    (void)device;
+    self.queryStatus = queryStatus;
+    self.done = YES;
+    if (self.releaseOnCompletion) [self release];
+}
+@end
 
 namespace allplay::posix {
 
 constexpr int kOpenTimeoutMs = 20000;
+constexpr int kSdpTimeoutMs = 10000;
 
 // ---------------------------------------------------------------------------
 // RFCOMM 字节流
@@ -267,13 +284,13 @@ public:
             MacRfcommStream* stream = nullptr;
             std::string      err;
             bool             done = false;
+            std::mutex       mu;
+            std::condition_variable cv;
         };
         auto res = std::make_shared<Result>();
-        std::mutex              mu;
-        std::condition_variable cv;
 
         // IOBluetooth 打开+回调都要 run loop → 放专用线程
-        std::thread worker([res, &address, raw, &mu, &cv] {
+        std::thread worker([res, address, raw] {
             @autoreleasepool {
                 NSString* addr = [NSString stringWithUTF8String:address.c_str()];
                 IOBluetoothDevice* device = [IOBluetoothDevice deviceWithAddressString:addr];
@@ -284,9 +301,36 @@ public:
                     res->err = "deviceWithAddressString 失败（地址形态？）";
                 } else {
                     IOBluetoothSDPServiceRecord* record = [device getServiceRecordForUUID:u];
+                    if (!record) {
+                        SdpQueryDelegate* query = [[SdpQueryDelegate alloc] init];
+                        IOReturn queryResult = [device performSDPQuery:query];
+                        if (queryResult != kIOReturnSuccess) {
+                            res->err = "SDP 查询启动失败（ret=" + std::to_string((int)queryResult) + "）";
+                        } else {
+                            const auto deadline = std::chrono::steady_clock::now() +
+                                                  std::chrono::milliseconds(kSdpTimeoutMs);
+                            while (!query.done && std::chrono::steady_clock::now() < deadline) {
+                                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                                         beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+                            }
+                            if (!query.done) {
+                                res->err = "SDP 查询超时（检查蓝牙权限及手机连接状态）";
+                            } else if (query.queryStatus != kIOReturnSuccess) {
+                                res->err = "SDP 查询失败（ret=" + std::to_string((int)query.queryStatus) + "）";
+                            } else {
+                                record = [device getServiceRecordForUUID:u];
+                            }
+                        }
+                        if (queryResult != kIOReturnSuccess || query.done) {
+                            [query release];
+                        } else {
+                            query.releaseOnCompletion = YES;
+                        }
+                    }
                     BluetoothRFCOMMChannelID chid = 0;
                     if (!record) {
-                        res->err = "SDP 查不到 iAP2 SPP 服务（未配对/无权限/手机没广播）";
+                        if (res->err.empty())
+                            res->err = "SDP 查询完成但查不到 iAP2 SPP 服务（手机没广播该 UUID）";
                     } else if ([record getRFCOMMChannelID:&chid] != kIOReturnSuccess) {
                         res->err = "取 RFCOMM channel 号失败";
                     } else {
@@ -299,10 +343,10 @@ public:
                 }
                 res->stream = stream;
                 {
-                    std::lock_guard<std::mutex> lk(mu);
+                    std::lock_guard<std::mutex> lk(res->mu);
                     res->done = true;
                 }
-                cv.notify_all();
+                res->cv.notify_all();
 
                 if (stream) {
                     // 常驻：跑 run loop 收数据；通道关闭后退出
@@ -314,8 +358,8 @@ public:
             }
         });
 
-        std::unique_lock<std::mutex> lk(mu);
-        if (!cv.wait_for(lk, std::chrono::milliseconds(kOpenTimeoutMs + 5000),
+        std::unique_lock<std::mutex> lk(res->mu);
+        if (!res->cv.wait_for(lk, std::chrono::milliseconds(kSdpTimeoutMs + kOpenTimeoutMs + 5000),
                          [&] { return res->done; })) {
             worker.detach();
             if (err) *err = "连接流程超时";
