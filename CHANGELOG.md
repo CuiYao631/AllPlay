@@ -7,6 +7,191 @@
 
 ---
 
+## [v1.1] — 多协议后端骨架 · 2026-11-08
+
+把 `core/` 拆成"协议后端"结构：CarPlay 成为第一个后端，Android Auto 有线模块落地，
+CarLife / HiCar 先占接口。宿主行为不变（仍走原路径），桌面构建与现有自测全绿。
+
+### 新增
+
+- **协议后端接口**（`core/projection/backend.h`）：`IProjectionBackend` /
+  `IProjectionSession` / `IProjectionSink` / `BackendRegistry`。宿主只认协议中立的
+  目标、输入事件与媒体配置，不再直接碰 iAP2 / RTSP；迁移方案见
+  `docs/projection-backend.md`。
+- **CarPlay 后端**（`core/projection/carplay/backend_carplay.*`）：无线（bt_trigger +
+  Receiver）与有线（usbmux / WiredControl / iAP2）两种会话都包进同一接口；平台能力经
+  `WiredPorts` 注入，core 里没有平台头。
+- **Android Auto 有线**（`core/projection/androidauto/`）：AOAP 51/52/53 → AAP VERSION →
+  TLS 1.2（记录装在 0x0003）→ 服务发现 → 通道 / AV SETUP / 媒体流。自带 protobuf wire
+  子集与 Annex-B → avcC 合成，PCM 小端转大端后交给宿主；实现 AV_MEDIA_ACK 流控。
+  `platform/posix/aa_usb_libusb.cpp` 提供 Linux/macOS 共用的 libusb 传输层。
+- **CarLife / HiCar 占位后端**：接口齐全，`probe()` 返回空、`connect()` 报未实现。
+- **自测** `tools/aa_wire_test.cpp`：AAP 分帧/拼帧、6 字节长度字段、半帧、protobuf 编解码。
+
+### 变更
+
+- `core/airplay` / `core/iap2` / `core/mfi` / `core/usb` / `core/bt` 整体迁到
+  `core/projection/carplay/`（纯 `git mv` + include 路径兼容），协议代码零改动。
+- 鸿蒙与 Android 的构建文件跟着新路径更新。
+
+### 已知限制
+
+- 宿主仍走原来的 `Receiver` / `WiredTask` / `BtTask`，尚未切到 `BackendRegistry`；
+  Android Auto 也还没有 UI 入口。
+- Android Auto 只完成协议与传输层实现，**未上真机验证**；无线 AA、CarLife、HiCar 未实现。
+
+---
+
+## [v1.0] — 真机稳定性 · 2026-11-06
+
+iPhone SE2 / 16 连续上手用下来修的一批问题。
+
+### 修复
+
+- **一直滑动会卡死**（`core/airplay/event_channel.cpp`）：触摸原来是 UI 线程直接
+  加密 + `send()`，手机忙着重绘时发送缓冲写满，UI 线程就卡在系统调用里；这条通道的
+  读线程（要给手机回 ACK）也被同一把锁挡着。现在拆出独立写线程，调用方只入队；
+  触摸按"位置快照"处理，新的直接顶掉还没发出去的旧的。
+- **开流那一下的噪音**：手机开流时先囤约两秒再一口气吐过来，把 1s 的环形池撑爆后，
+  旧逻辑"超出多少丢多少"，连续几十个 9~21ms 的断口连成一片。改成一次切到 70%，
+  一个断口代替几十个。
+- **开流起手的卡顿**：头一拍水位从 250ms 提到 800ms，开声后再降回续播水位，
+  扛住手机开流时的第一次停顿。
+- **听歌时偶尔卡一下（没有任何操作）**：手机送音频是**成团**的——实测连续两包之间
+  能空 569ms，RTP 序号连着、一个包都没丢，只是没发。水位低于这个空档就会每来一波
+  抽干一次。环形池 1s→1.5s、续播水位 250ms→700ms（569ms + 余量），按实测空档定，
+  不再拍脑袋定。
+- **0x4301 之后手机不拨号**：iOS 有概率不主动连 AirPlay 端口（实测空了 14.5 秒，
+  黑屏那几次干脆一直没连），只有人工关开一次 Wi-Fi 才会重连。现在 3 秒没等到连接
+  就重发 `0x5703 + 0x4301`，最多催两次。
+
+### 新增
+
+- **Wi-Fi 加密方式可选**（设置页）：无密码 / WEP / WPA2 / WPA3，`0x5703` 与
+  `0x4301` 里的 `securityType` 跟着走（以前写死 2）；开放网络不再要求填密码。
+
+### 诊断
+
+- 音频侧补齐了四路信号：收包空档（>80ms，带 RTP 序号差）、环形池溢出、
+  **每一次**欠载、声卡回调停摆（>300ms）与系统打断/报错。
+
+---
+
+## [v0.9] — 方控接口 · 2026-11-06
+
+`core` 里立起方控（方向盘媒体键）这一层：上层把按键放进队列，无线/有线两条 iAP2 链路
+各自编码成 HID 报表发给手机。接口与编码已自测通过；`0x4E0x` 消息号、报表格式和按键来源
+都还等真机与各平台去接。
+
+### 新增
+
+- **方控接口**（`core/port/control.h`）：`MediaKey`（播放/暂停、上一首/下一首、Siri、
+  接听/挂断…）+ 线程安全的 `MediaKeyQueue` + `IMediaKeySink`。方向是**车机 → 手机**，
+  与 `media.h` 相反。按键从哪来（界面按钮、系统媒体键、将来的硬件驱动）由上层实现。
+- **HID 编码**（`core/iap2/hid.h`）：`MediaKey` → HID usage（消费者页 0x0C / 电话页 0x0B）
+  → 报表字节 → `0x4E02` 报文。无线的 `WirelessTrigger` 在 `run()` 里排干队列，
+  有线的 `WiredLink` 提供 `sendMediaKey` / `pumpMediaKeys` 由调用方在 pump 之间调用。
+  **`0x4E0x` 这一族消息号与报表格式尚未在真机上核验**，接真机时用抓包对一遍（要改只有一处）。
+- 自测补 ①b 段：usage 映射、按下/抬起报表、报文往返、队列 FIFO 与溢出。
+
+---
+
+## [v0.8] — 鸿蒙音频出声 · 2026-11-06
+
+Mate 60 上 CarPlay 的声音出来了：手机建的音频流（type=102、AAC-LC、48kHz 立体声、裸帧）
+在本机解码后由系统声卡播放。视频、触摸、音频三条流第一次同时跑通。
+
+### 新增
+
+- **音频输出**（`harmony/entry/src/main/cpp/harmony_audio.cpp`）：`core::IAudioOutput` 的鸿蒙实现。
+  解码用 `OH_AudioCodec` 的**同步模式**（`OH_MD_KEY_ENABLE_SYNC_MODE=1`，默认的异步模式下
+  `QueryInputBuffer` 一律返回 `AV_ERR_OPERATE_NOT_PERMIT`），播放用 `OHAudio` 渲染器的
+  `OnWriteData` 回调。解码在两把锁的里侧、播放回调只碰环形池，10ms 的解码查询永远堵不到声卡。
+
+### 修复
+
+- **裸 AAC 帧必须补 ADTS 头**：`OH_MD_KEY_AAC_IS_ADTS=0` 是 LATM，喂裸帧时解码器只吃不吐
+  （实测 3000 包解出 0 帧）。改成每帧前补 7 字节 ADTS 头、该键置 1，48 帧解出 47 帧；
+  带外 ASC（`OH_MD_KEY_CODEC_CONFIG`）那条路在同一台机上解出 0 帧。
+- **"先接住不播"变成能播**：此前 `feed()` 是空实现，现在整条链路走通。
+- **卡顿三连**：回调块从 93ms 钉小又放开、续播水位低于一次回调、`QueryOutputBuffer` 用 0 超时
+  导致 PCM 积在解码器里——三处合起来表现为持续爆点（600 次回调欠载 193 次）。
+  现在环形池 700ms + 续播水位 250ms + 2ms 输出轮询，实测欠载降到 0～3/600。
+- **滑动时偶发卡顿**是发送端的问题：同一台 Mate 60 换 iPhone 16 作为发送端后不再复现，
+  iPhone 13 mini 在滑动时自身掉帧。
+
+### 已知限制
+
+- **iOS 13 及更老系统连不上**：iPhone SE2（iOS 13）在 0x1D01 识别这一步被回 0x1D03，
+  报的参数 id 含 6/7/10。全量消息清单、只报 CarPlay 必需的最小集、完全不报清单三组都试过，
+  连报空了也被拒——是手机侧不接受，不是报文格式问题（同样的字节 iOS 16/18 收）。
+  iOS 13 的 SE2 升级系统后可正常连；代码里保留了"被拒就逐级收窄重试"的兜底。
+
+## [v0.7] — HarmonyOS 无线真机端到端 · 2026-11-05
+
+鸿蒙（**Mate 60**）上也走通了：蓝牙 iAP2 把 iPhone 叫醒 → 同网 Wi-Fi → RTSP 协商 →
+**硬解上屏、横屏铺满、触摸可点**。协议核心一行没分叉，`core/airplay` 原样经 NAPI 编进 HAP。
+
+### 新增
+
+- **鸿蒙平台**：ArkTS + hvigor 工程（`harmony/`）。蓝牙 SPP（`socket.sppConnect`）、mDNS 广播、
+  屏幕尺寸走系统 API；协议全部在 `core/`，由 `liballplay_core.so` 经 NAPI 桥接。
+- **AVCodec 硬解上屏**（`harmony_decoder.cpp`）：`OH_VideoDecoder_CreateByMime` + 回调式输入输出，
+  `RenderOutputBuffer` 直接画到 `XComponent` 的 surface（surface id → `OHNativeWindow`）。
+- **全屏**：`/info` 里协商的显示分辨率改成**按屏幕长宽比**（1080p 档、宽封 1920，实测 1920×868），
+  iPhone 会按这个尺寸重排 CarPlay 界面；会话进来转横屏，断开转回竖屏。
+- **触摸回传**：`XComponent.onTouch` → 归一化坐标 → 事件通道 HID `touchReport`（双触点）。
+- **构建脚本**：`scripts/build-ohos-openssl.sh`（交叉编译 OHOS OpenSSL）、
+  `scripts/sync-harmony-identity.sh`（把 `identity/` 临时拷进 HAP rawfile，仍在 `.gitignore`）。
+
+### 修复
+
+- **avcC 的 SPS/PPS 必须 in-band**：`OH_MD_KEY_CODEC_CONFIG` 在这台机的解码器上被忽略
+  （系统日志 `pps is null` / `EVNT_PARAMETER_SETS_LOST`），改成每个 IDR 前补一份 AnnexB。
+- **手机每 ~5 秒重发同一份 avcC**：原先每次重建解码器，参考链清空、画面周期性卡住；
+  改成按 `csd + 尺寸 + 编码类型` 比对，相同就跳过重建。
+- **横竖屏切换后画面停住**：转屏会重建 `XComponent`，旧的 `OHNativeWindow` 指向已回收的 surface。
+  surface id 变化时拆掉重建，并用上次的 csd 立刻恢复，不等手机重发配置。
+
+### 已知限制
+
+- **音频只接住不播**：`IAudioOutput` 收下数据后丢弃，鸿蒙侧还没接 AudioRenderer。
+- **流式播放时没有退出入口**：画面铺满整块屏，启动页上的"取消"被盖住，只能从手机或系统侧退出。
+- 设备选择与热点 SSID/密码未持久化，应用重启后要重新选一次。
+
+---
+
+## [v0.6] — macOS 无线真机端到端 · 2026-11-05
+
+真 iPhone 在 Mac 上走**蓝牙 iAP2 → 同网 Wi-Fi 投屏**跑通，并把"车机该有的常驻行为"补齐：
+手机离开自动回启动页，回来自动重新进 CarPlay，全程不用碰宿主。启动页整个重做。
+
+### 新增
+
+- **启动页重做**（`host/launcher`）：按 1540×850 设计稿坐标绘制后整体缩放，线性采样让圆角/圆弧
+  不再出台阶；显示**蓝牙适配器名**（手机蓝牙列表里看到的那个，不是 Bonjour 名）、中/EN 语言切换、
+  连接状态与等待动效。
+- **高 DPI 渲染**：`SDL_WINDOW_ALLOW_HIGHDPI`，渲染面按物理像素（Retina 2×）出图；同时补上
+  窗口"点"与渲染"像素"的换算 —— 否则启动页鼠标命中与触摸坐标都会偏（实测 Mac 上触摸 y 轴偏上）。
+- **双通道 `--dual`**：有线（USB）+ 无线**同时**监听，谁先连上算谁；另一条把后来的连接挡在门外，
+  会话结束自动放行。
+- **常驻重连**：`--bt` 下手机离开后隔 5 秒自动重新触发，不需要按键，也不需要重启宿主。
+
+### 修复
+
+- **重连后整场 CarPlay 总在 5 秒定时器上被掐断**：事件通道对象跨会话复用（监听端口不变），
+  但读写密钥是**每场** pair-verify 出来的。宿主周期发的 `forceKeyFrame` 用旧密钥加密，手机解不开，
+  iOS 直接结束会话。新增 `EventChannel::rekey()`，每条会话首次 SETUP 用本场 sharedSecret 重算密钥。
+- **会话活到 90 秒自己断**：0x4301 发出后这条 iAP2 链路就是无线 CarPlay 的心跳线，iOS 一直在上面
+  发消息、配件必须继续读并 ACK。触发窗口（90s）一到就停读，iOS 约 30 秒后判定配件掉线并 TEARDOWN。
+  改成发出 0x4301 后长期保持，直到链路真的断。
+- **手机回来不会自动进 CarPlay**：常驻心跳让触发线程一直守在旧链路上，永远等不到新的 0x4301。
+  增加取消旗标：会话结束（或空等 45 秒）就撤掉这次触发，重排下一次。
+- **手机离开后回启动页卡 10 秒**：控制连接空闲判定 10s → 5s，并在日志里打出断线原因
+  （读超时 = 手机不再发包 / 读返回断开 = 对端关闭），不再靠猜。
+
+---
+
 ## [v0.5] — Android 4.4（API 19）· 2026-10-14
 
 安卓端降到 **Android 4.4（API 19）**，在 32 位 Amlogic S905M 电视盒子上真机跑通

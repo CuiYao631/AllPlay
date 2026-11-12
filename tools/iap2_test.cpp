@@ -3,6 +3,7 @@
 // ============================================================================
 // 覆盖：
 //   ① 线格式：参数编解码往返、字符串 NUL、CSM 拆帧（含垃圾前置/分片）
+//   ①b 方控：媒体键 → HID usage/报表 → 0x4E02 报文、按键队列的进出与溢出
 //   ② 链路层：两个 LinkEngine 经内存管道握手（marker→SYN→ACK→NORMAL），
 //      控制载荷双向可靠送达、序号/校验和路径正确
 //   ③ MFi 签名：identity/ 加载 + 32 字节摘要签名 + 用证书公钥验签
@@ -10,10 +11,12 @@
 //      跑完 识别→MFi→订阅→0x5703→0x4301
 //
 // 用法： iap2_test [identity目录]   （默认 <项目根>/identity）
+#include "iap2/hid.h"
 #include "iap2/link.h"
 #include "iap2/wire.h"
 #include "iap2/wireless_client.h"
 #include "mfi/mfi_identity.h"
+#include "port/control.h"
 
 #include <openssl/bn.h>
 #include <openssl/ecdsa.h>
@@ -26,6 +29,8 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -134,6 +139,56 @@ void testWire()
 }
 
 // ---------------------------------------------------------------------------
+// ①b 方控（媒体键 → HID 报表 → iAP2 报文）
+// ---------------------------------------------------------------------------
+void testHid()
+{
+    std::printf("== ①b 方控编码 ==\n");
+    using namespace core::iap2;
+
+    const HidUsage next = mediaKeyUsage(core::MediaKey::NextTrack);
+    CHECK(next.page == 0x000c && next.id == 0x00b5, "下一首 → Consumer Scan Next(0xB5)");
+    const HidUsage hook = mediaKeyUsage(core::MediaKey::PhoneAccept);
+    CHECK(hook.page == 0x000b && hook.id == 0x0020, "接听 → Telephony HookSwitch");
+
+    // 按下报 usage，抬起报 0（HID 惯例）
+    const auto down = hidReport(core::MediaKey::NextTrack, true);
+    CHECK(down.size() == 4 && down[0] == 0x0c && down[1] == 0x00 && down[2] == 0xb5 &&
+          down[3] == 0x00, "按下报表 = 页 0x000C / usage 0x00B5（小端）");
+    const auto up = hidReport(core::MediaKey::NextTrack, false);
+    CHECK(up.size() == 4 && up[2] == 0 && up[3] == 0, "抬起报表 usage = 0");
+    const auto withId = hidReport(core::MediaKey::PlayPause, true, 3);
+    CHECK(withId.size() == 5 && withId[0] == 3, "带报表 ID 时首字节是 ID");
+
+    // 报文：CSM id = 0x4E02，参数 0 = 报表
+    const auto frame = hidReportMessage(core::MediaKey::NextTrack, true);
+    CsmFramer fr;
+    fr.feed(frame.data(), frame.size());
+    uint16_t id = 0;
+    std::vector<uint8_t> body;
+    CHECK(fr.next(&id, &body) && id == kAccessoryHidReport, "报文的 CSM id = 0x4E02");
+    std::vector<Param> ps;
+    CHECK(parseParams(body.data(), body.size(), &ps) && ps.size() == 1 && ps[0].id == 0 &&
+          ps[0].payload == down, "参数 0 = 报表字节");
+
+    // 队列：先进先出；超过容量丢最老的
+    core::MediaKeyQueue q;
+    q.push(core::MediaKey::Play, true);
+    q.push(core::MediaKey::Play, false);
+    core::MediaKeyEvent ev;
+    CHECK(q.pop(&ev) && ev.key == core::MediaKey::Play && ev.down, "队列先进先出");
+    CHECK(q.pop(&ev) && !ev.down, "队列出到抬起事件");
+    CHECK(!q.pop(&ev), "空队列返回 false");
+    const size_t extra = 3;
+    for (size_t i = 0; i < core::MediaKeyQueue::kCapacity + extra; ++i)
+        q.push(core::MediaKey::NextTrack, i % 2 == 0);
+    CHECK(q.size() == core::MediaKeyQueue::kCapacity, "满了不再长");
+    // 最老的三条被丢掉，队首是第 3 条（i=3 → down=false）
+    CHECK(q.pop(&ev) && ev.key == core::MediaKey::NextTrack && !ev.down,
+          "溢出丢最老的那条");
+}
+
+// ---------------------------------------------------------------------------
 // ② 链路层握手 + 数据
 // ---------------------------------------------------------------------------
 void testLink()
@@ -234,6 +289,30 @@ void testMfi(const std::string& dir)
     // 篡改摘要应验不过
     digest[0] ^= 0x01;
     CHECK(!verifyRawSig(id->certificate(), digest, sig), "错摘要验签失败（阴性对照）");
+
+    // 同一份身份从内存加载 —— 鸿蒙走的就是这条路（HAP rawfile 读字节，读不到路径）
+    {
+        auto slurp = [](const std::string& p, std::vector<uint8_t>* out) {
+            std::ifstream in(p, std::ios::binary);
+            out->assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            return !out->empty();
+        };
+        std::vector<uint8_t> key, cert;
+        if (slurp(dir + "/identity.pk8", &key) && slurp(dir + "/certificate.p7b", &cert)) {
+            std::string err;
+            auto id2 = core::mfi::CertificateMfiIdentity::loadFromMemory(
+                key.data(), key.size(), cert.data(), cert.size(), &err);
+            CHECK(id2 && id2->certificate() == id->certificate(),
+                  "从内存加载身份（证书与目录加载一致）");
+            if (id2) {
+                digest[0] ^= 0x01;   // 还原成原摘要
+                bool ok2 = false;
+                auto sig2 = id2->signDigest(digest, 32, &ok2);
+                CHECK(ok2 && verifyRawSig(id2->certificate(), digest, sig2),
+                      "内存加载的身份也能签出可验签的名字");
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +337,11 @@ void testFlow(const std::string& dir)
     cfg.publicKeyHex = std::string(64, 'a');
     cfg.mfiDir = dir;
     cfg.timeoutMs = 15000;
+    // 0x4301 发出后 run() 不会自己结束 —— 那是无线 CarPlay 的心跳线，得一直读
+    // （见 wireless_client.cpp 里的 kSessionKeepAliveMs）。测试在拿齐证据后置位取消，
+    // 否则 t.join() 会一直挂着。
+    std::atomic<bool> cancel{false};
+    cfg.cancel = &cancel;
 
     WirelessTrigger trigger(&triggerStream, cfg);
     std::atomic<bool> triggerDone{false}, triggerOk{false};
@@ -356,6 +440,7 @@ void testFlow(const std::string& dir)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
+    cancel.store(true);   // 证据已收齐，让常驻的触发线程收工（见上面 cfg.cancel 注释）
     t.join();
     CHECK(triggerDone.load(), "触发线程结束");
     CHECK(triggerOk.load(), "触发返回成功（0x4301 已发出）");
@@ -380,6 +465,7 @@ int main(int argc, char** argv)
 {
     const std::string dir = argc > 1 ? argv[1] : "identity";
     testWire();
+    testHid();
     testLink();
     testMfi(dir);
     testFlow(dir);

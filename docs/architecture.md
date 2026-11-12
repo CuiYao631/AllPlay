@@ -187,6 +187,7 @@ AAC-LC 无 ADTS 头（且会把 ≤12 字节的 config 小包也喂进来，要�
 | TCP / UDP | POSIX socket ✅ | POSIX socket ✅ | Socket ✅ | Winsock2 ✅ |
 | 网卡信息 | `getifaddrs` ✅ | `getifaddrs` ✅ | `NetworkInterface` ✅ | `GetAdaptersAddresses` ✅ |
 | 蓝牙 | **BlueZ**（SDP + 裸 RFCOMM，客户端模式）✅ 真机验到 `0xAA00` | IOBluetooth ⏳ 未真机验收 | `BluetoothSocket` ✅ | `AF_BTH` ⏳ 骨架 |
+| 有线（USB） | libusb 切配置 + usbmux v2 + 内核 `cdc_ncm` ✅ 真机端到端 | 系统 `usbmuxd` + `AppleUSBNCMData`（不碰 USB，无需 DriverKit）✅ 真机端到端（投屏 + 声音） | — | — |
 | mDNS | avahi ✅ | dns_sd ✅ | `NsdManager` ✅ | ⏳ 待做 |
 | 视频输出 | ffmpeg 软解 + SDL2 ✅ | ffmpeg 软解 + SDL2 ✅ | MediaCodec 硬解 ✅ | ffmpeg ⏳ 待接 |
 | 音频输出 | SDL2（AAC-LC / Opus / LPCM）✅ | SDL2 ✅ | AudioTrack ✅ | ⏳ 待接 |
@@ -197,6 +198,7 @@ AAC-LC 无 ADTS 头（且会把 ≤12 字节的 config 小包也喂进来，要�
 ```
 platform/posix/  net_posix.cpp      mdns_avahi.cpp | mdns_dns_sd.cpp
                  bt_bluez.cpp      | bt_iobluetooth.mm
+                 usb_libusb.cpp    | usbmuxd_mac.cpp
 platform/windows/ net_windows.cpp   bt_windows.cpp
 android/.../cpp/  jni_bridge.cpp
 ```
@@ -216,3 +218,24 @@ android/.../cpp/  jni_bridge.cpp
    别照着"服务端等手机连"的思路写。
 6. **宿主**：把上面几件装配成 `PlatformServices` + `ReceiverConfig`，起主循环。
 7. **验收**：`tools/fake_phone` 跑端到端（不需要 iPhone），再拿真机验蓝牙那一段。
+
+## 八、多协议演进（草案）
+
+CarPlay 目前直接写在 `core/airplay` / `core/iap2` 等目录里。要让同一套 `core` 再接
+Android Auto / CarLife / HiCar，路线是**协议后端化**：宿主只依赖
+`core::projection::IProjectionBackend`，CarPlay 是第一个后端，其余按同一接口接入。
+接口草案与迁移方案见 [projection-backend.md](projection-backend.md)。
+
+当前状态（2026-11-08）：
+
+| 后端 | 代码 | 状态 |
+|---|---|---|
+| CarPlay | `core/projection/carplay/`（`backend_carplay` 包住原 airplay/iap2/mfi/usb/bt） | 模块已就位，宿主尚未切换 |
+| Android Auto（有线） | `core/projection/androidauto/` + `platform/posix/aa_usb_libusb.cpp` | 编译通过，待真机 |
+| CarLife | `core/projection/carlife/` | 占位（接口齐全，未实现） |
+| HiCar | `core/projection/hicar/` | 占位（接口齐全，未实现） |
+
+AA 的有线链路是 AOAP（51/52/53）→ AAP VERSION → TLS 1.2（记录装在 0x0003）→
+服务发现 → 通道 / 音视频 / 输入。protobuf 只实现了 wire 子集（`proto.h`），
+TLS 用系统 OpenSSL，不引 protobuf / Boost / AASDK 代码。
+
